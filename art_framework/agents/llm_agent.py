@@ -76,6 +76,9 @@ class LLMAgent(Agent):
             
         Returns:
             Generated text response
+            
+        Raises:
+            ValueError: If the model returns an empty completion
         """
         if not self._is_initialized or self._client is None:
             await self.initialize()
@@ -86,15 +89,20 @@ class LLMAgent(Agent):
         payload = {
             "model": self.config.model_name,
             "messages": messages,
-            "temperature": temperature or self.config.temperature,
-            "max_tokens": max_tokens or self.config.max_tokens,
+            "temperature": (
+                temperature if temperature is not None else self.config.temperature
+            ),
+            "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
         
         try:
             response = await self._client.post(url, json=payload)  # type: ignore
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"].get("content")
+            if content is None or not content.strip():
+                raise ValueError(f"Empty completion from {self.config.model_name}")
+            return content
         except Exception as e:
             logger.error(f"LLM API call failed: {e}")
             raise
