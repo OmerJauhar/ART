@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable
@@ -46,7 +46,7 @@ class RoundResult:
     
     round_id: str
     round_number: int
-    responses: dict[str, AgentResponse]  # agent_id -> response
+    responses: dict[str, AgentResponse]  # agent_id -> response critiqued and scored this round
     critiques: dict[str, list[Critique]]  # agent_id -> critiques received
     scores: dict[str, float]  # agent_id -> round score
     elo_updates: list[EloUpdate]
@@ -188,6 +188,7 @@ class TournamentEngine:
         self._current_round: int = 0
         self._tournament_history: list[TournamentResult] = []
         self._active_agents: set[str] = set(self.agents.keys())
+        self._previous_round: RoundResult | None = None
     
     async def initialize_agents(self) -> None:
         """Initialize all agents."""
@@ -203,6 +204,12 @@ class TournamentEngine:
     ) -> TournamentResult:
         """
         Run a complete tournament for a given query.
+        
+        Only round 1 generates answers. Each later round (championship rounds included)
+        first has every still-active agent revise its previous answer using the critiques
+        it received, then critiques and scores the revised answers. With N agents, R rounds
+        and no agent filtering, one question costs N generations + R*N*(N-1) critiques +
+        (R-1)*N revisions.
         
         Args:
             query: The query/task for agents to respond to
@@ -220,6 +227,7 @@ class TournamentEngine:
         
         self._current_tournament_id = tournament_id
         self._active_agents = set(self.agents.keys())
+        self._previous_round = None
         
         start_time = datetime.utcnow()
         all_rounds: list[RoundResult] = []
@@ -250,9 +258,10 @@ class TournamentEngine:
             # Calculate final rankings
             final_rankings = self._get_rankings()
             
-            # Determine winner and best response
-            winner_id = final_rankings[0][0]
-            best_response = all_rounds[-1].responses[winner_id]
+            # Determine winner and best response from answers scored in the final round
+            winner_id, best_response = self._select_best_response(
+                all_rounds[-1], final_rankings
+            )
             
             end_time = datetime.utcnow()
             duration_ms = (end_time - start_time).total_seconds() * 1000
@@ -285,6 +294,35 @@ class TournamentEngine:
         finally:
             self._current_tournament_id = None
             self._current_round = 0
+            self._previous_round = None
+    
+    def _select_best_response(
+        self,
+        last_round: RoundResult,
+        rankings: list[tuple[str, float]],
+    ) -> tuple[str, AgentResponse]:
+        """
+        Pick the highest-ranked agent whose answer was scored in the last round.
+        
+        Args:
+            last_round: The final round of the tournament
+            rankings: Agents sorted by ELO, best first
+            
+        Returns:
+            Tuple of (winner agent_id, the answer that was scored for it)
+            
+        Raises:
+            RuntimeError: If no answer received any critique in the last round
+        """
+        for agent_id, _ in rankings:
+            if last_round.critiques.get(agent_id) and agent_id in last_round.responses:
+                if agent_id != rankings[0][0]:
+                    logger.warning(
+                        f"Top-ranked agent {rankings[0][0]} was not scored in the final "
+                        f"round; using {agent_id} as winner"
+                    )
+                return agent_id, last_round.responses[agent_id]
+        raise RuntimeError("No response was scored in the final round")
     
     async def _run_round(
         self,
@@ -293,14 +331,22 @@ class TournamentEngine:
         round_number: int,
         config: TournamentConfig,
     ) -> RoundResult:
-        """Run a single round of the tournament."""
+        """
+        Run a single round of the tournament.
+        
+        The first round generates answers; later rounds revise and re-score the answers
+        carried over from the previous round.
+        """
         round_id = str(uuid.uuid4())
         start_time = datetime.utcnow()
         
         logger.info(f"Starting round {round_number}")
         
-        # Step 1: Generate responses
-        responses = await self._generate_responses(query, query_id, config)
+        # Step 1: Generate answers (first round) or revise the carried answers
+        if self._previous_round is None:
+            responses = await self._generate_responses(query, query_id, config)
+        else:
+            responses = await self._carry_responses(query, query_id, config)
         
         # Step 2: Cross-evaluation
         critiques = await self._cross_evaluate(query, responses, config)
@@ -326,17 +372,13 @@ class TournamentEngine:
         # Step 4: Update ELO ratings
         elo_updates = self._update_elo_ratings(scores)
         
-        # Step 5: Improve responses if enabled
-        if config.enable_response_improvement and round_number < config.rounds_per_tournament:
-            responses = await self._improve_responses(query, responses, critiques)
-        
         # Determine best response
         best_agent_id = max(scores.items(), key=lambda x: x[1])[0]
         
         end_time = datetime.utcnow()
         duration_ms = (end_time - start_time).total_seconds() * 1000
         
-        return RoundResult(
+        round_result = RoundResult(
             round_id=round_id,
             round_number=round_number,
             responses=responses,
@@ -347,20 +389,22 @@ class TournamentEngine:
             duration_ms=duration_ms,
             failed_critiques=failed_critiques,
         )
+        self._previous_round = round_result
+        return round_result
     
     async def _generate_responses(
         self,
         query: str,
         query_id: str,
         config: TournamentConfig,
+        agent_ids: list[str] | None = None,
     ) -> dict[str, AgentResponse]:
-        """Generate responses from all active agents."""
+        """Generate responses from the given agents (all active agents by default)."""
         responses: dict[str, AgentResponse] = {}
         
-        active_agents = [
-            self.agents[aid] for aid in self._active_agents
-            if aid in self.agents
-        ]
+        if agent_ids is None:
+            agent_ids = list(self._active_agents)
+        active_agents = [self.agents[aid] for aid in agent_ids if aid in self.agents]
         
         if config.parallel_responses:
             # Generate responses in parallel
@@ -489,6 +533,44 @@ class TournamentEngine:
                     agent.record_draw()
         
         return updates
+    
+    async def _carry_responses(
+        self,
+        query: str,
+        query_id: str,
+        config: TournamentConfig,
+    ) -> dict[str, AgentResponse]:
+        """
+        Carry the previous round's answers into this round for every active agent.
+        
+        Answers are revised with the critiques they received when improvement is enabled;
+        a failed revision falls back to the previous answer. An active agent with no
+        previous answer gets a freshly generated one.
+        """
+        previous = self._previous_round
+        assert previous is not None
+        
+        active_ids = [aid for aid in self._active_agents if aid in self.agents]
+        carried = {
+            aid: previous.responses[aid] for aid in active_ids if aid in previous.responses
+        }
+        if config.enable_response_improvement:
+            carried = await self._improve_responses(query, carried, previous.critiques)
+        
+        # Copy answers carried unchanged so this round's scoring does not alter the
+        # objects stored in the previous round's result
+        for aid, response in carried.items():
+            if response is previous.responses.get(aid):
+                carried[aid] = replace(response, metadata=dict(response.metadata))
+        
+        missing = [aid for aid in active_ids if aid not in carried]
+        if missing:
+            logger.warning(f"No carried answer for agents {missing}; generating fresh answers")
+            carried.update(
+                await self._generate_responses(query, query_id, config, agent_ids=missing)
+            )
+        
+        return carried
     
     async def _improve_responses(
         self,
