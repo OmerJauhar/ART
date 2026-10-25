@@ -59,6 +59,10 @@ class AgentState:
     total_critiques_given: int = 0
     total_critiques_received: int = 0
     performance_metrics: dict[str, float] = field(default_factory=dict)
+    llm_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
     created_at: datetime = field(default_factory=datetime.utcnow)
     last_active: datetime = field(default_factory=datetime.utcnow)
     
@@ -109,6 +113,7 @@ class Critique:
     suggestions: list[str] = field(default_factory=list)
     reasoning: str = ""
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 class Agent(ABC):
@@ -275,6 +280,10 @@ class Agent(ABC):
             "draws": self.state.draws,
             "win_rate": self.state.win_rate,
             "total_queries": self.state.total_queries,
+            "llm_calls": self.state.llm_calls,
+            "prompt_tokens": self.state.prompt_tokens,
+            "completion_tokens": self.state.completion_tokens,
+            "cost_usd": self.state.cost_usd,
             "created_at": self.state.created_at.isoformat(),
             "last_active": self.state.last_active.isoformat(),
         }

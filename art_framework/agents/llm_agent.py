@@ -39,6 +39,7 @@ class LLMAgent(Agent):
         super().__init__(config)
         self._client: httpx.AsyncClient | None = None
         self._default_headers: dict[str, str] = {}
+        self._last_usage: dict[str, Any] = {}
     
     async def initialize(self) -> None:
         """Initialize the agent and verify API connectivity."""
@@ -75,7 +76,8 @@ class LLMAgent(Agent):
             max_tokens: Override max tokens setting
             
         Returns:
-            Generated text response
+            Generated text response. Token usage and cost for the call are
+            stored on ``self._last_usage`` and added to the agent's totals.
             
         Raises:
             ValueError: If the model returns an empty completion
@@ -102,10 +104,41 @@ class LLMAgent(Agent):
             content = data["choices"][0]["message"].get("content")
             if content is None or not content.strip():
                 raise ValueError(f"Empty completion from {self.config.model_name}")
+            self._last_usage = self._record_usage(data.get("usage") or {})
             return content
         except Exception as e:
             logger.error(f"LLM API call failed: {e}")
             raise
+    
+    def _record_usage(self, usage: dict[str, Any]) -> dict[str, Any]:
+        """
+        Add one call's token usage and cost to the agent's running totals.
+        
+        OpenRouter returns ``usage.cost`` (in USD-denominated credits) on every
+        chat completion without any request option. Other OpenAI-compatible
+        providers usually omit it, in which case cost is recorded as 0.0.
+        
+        Args:
+            usage: The ``usage`` object from the chat completions response
+            
+        Returns:
+            Per-call dict with prompt_tokens, completion_tokens and cost
+        """
+        # TODO: compute cost from per-token prices for providers that do not return usage.cost
+        cost = usage.get("cost")
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            cost = 0.0
+        call_usage = {
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "cost": float(cost),
+        }
+        
+        self.state.llm_calls += 1
+        self.state.prompt_tokens += call_usage["prompt_tokens"]
+        self.state.completion_tokens += call_usage["completion_tokens"]
+        self.state.cost_usd += call_usage["cost"]
+        return call_usage
     
     async def generate_response(
         self,
@@ -140,6 +173,9 @@ class LLMAgent(Agent):
         
         try:
             content = await self._call_llm(messages)
+            # Read immediately: no await between _call_llm returning and this line,
+            # so concurrent calls on the same agent cannot overwrite it.
+            usage = dict(self._last_usage)
             latency_ms = (time.time() - start_time) * 1000
             
             self.state.total_queries += 1
@@ -152,7 +188,7 @@ class LLMAgent(Agent):
                 content=content,
                 confidence=0.85,  # Could be calculated based on model output
                 reasoning=f"Generated using {self.config.model_name}",
-                metadata={"model": self.config.model_name},
+                metadata={"model": self.config.model_name, "usage": usage},
                 latency_ms=latency_ms,
             )
         except Exception as e:
@@ -179,6 +215,7 @@ class LLMAgent(Agent):
         
         try:
             content = await self._call_llm(messages)
+            usage = dict(self._last_usage)
             scores = self._parse_critique_scores(content)
             
             self.state.total_critiques_given += 1
@@ -196,6 +233,7 @@ class LLMAgent(Agent):
                 cons=scores.get("cons", []),
                 suggestions=scores.get("suggestions", []),
                 reasoning=content,
+                usage=usage,
             )
         except Exception as e:
             logger.error(f"Critique generation failed: {e}")
@@ -366,6 +404,7 @@ and clarity.""",
         
         start_time = time.time()
         content = await self._call_llm(messages)
+        usage = dict(self._last_usage)
         latency_ms = (time.time() - start_time) * 1000
         
         return AgentResponse(
@@ -377,6 +416,7 @@ and clarity.""",
             metadata={
                 "model": self.config.model_name,
                 "critiques_incorporated": len(critiques),
+                "usage": usage,
             },
             latency_ms=latency_ms,
         )
