@@ -216,6 +216,45 @@ def sample_questions(
     return questions
 
 
+def select_questions(
+    questions: list[Question],
+    subsets: list[str] | None = None,
+    test_per_subset: int | None = None,
+) -> list[Question]:
+    """
+    Restrict the drawn sample without resampling.
+
+    Questions keep their sample order, index and split, so every request they make is the
+    same as in a run over the whole sample and earlier cached calls are reused.
+
+    Args:
+        questions: The sample, in sample order
+        subsets: Keep only these subsets (None keeps all)
+        test_per_subset: Keep every calibration question plus the first N test questions of
+            each subset in sample order (None keeps all test questions)
+
+    Returns:
+        The selected questions in sample order
+    """
+    if subsets is not None:
+        unknown = sorted(set(subsets) - {q.subset for q in questions})
+        if unknown:
+            raise ValueError(f"Unknown or unsampled subsets: {', '.join(unknown)}")
+    if test_per_subset is not None and test_per_subset < 0:
+        raise ValueError("test_per_subset must be non-negative")
+    selected = []
+    test_taken: dict[str, int] = {}
+    for question in questions:
+        if subsets is not None and question.subset not in subsets:
+            continue
+        if question.split == "test" and test_per_subset is not None:
+            if test_taken.get(question.subset, 0) >= test_per_subset:
+                continue
+            test_taken[question.subset] = test_taken.get(question.subset, 0) + 1
+        selected.append(question)
+    return selected
+
+
 def usable_counts(rows: dict[str, list[dict[str, Any]]]) -> dict[str, int]:
     """Number of text-only questions per subset."""
     return {subset: len(r) for subset, r in rows.items()}

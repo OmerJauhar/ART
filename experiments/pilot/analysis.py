@@ -23,6 +23,39 @@ NEVER_ACCEPT_TAU = 1.01
 
 CASCADES = ("cascade_llm", "cascade_jev")
 
+# The cascades escalate to art_r1 and the ELO router is fitted from art_r1's tournaments
+NEEDS_ART_R1 = ("cascade_llm", "cascade_jev", "elo_router")
+
+
+def all_methods(models: PilotModels) -> list[str]:
+    """Every method name in report order."""
+    return [f"single:{m.label}" for m in models.models] + [
+        "majority_vote", "art_r1", "art_r2", "judge", "fusion", "elo_router",
+        "best_single_calibration", "best_single_oracle", "jev_pick", *CASCADES,
+    ]
+
+
+def check_skip(skip: set[str], models: PilotModels) -> set[str]:
+    """
+    Validate a set of methods to skip.
+
+    The four answers are always made because nearly every method builds on them; skipping a
+    single:<model> method only leaves it out of the report.
+
+    Raises:
+        ValueError: On an unknown name, or when a kept method needs art_r1 but it is skipped
+    """
+    unknown = sorted(skip - set(all_methods(models)))
+    if unknown:
+        raise ValueError(
+            f"Unknown methods: {', '.join(unknown)}. Choose from: {', '.join(all_methods(models))}"
+        )
+    if "art_r1" in skip:
+        needing = [m for m in NEEDS_ART_R1 if m not in skip]
+        if needing:
+            raise ValueError(f"art_r1 is needed by {', '.join(needing)}; skip those too")
+    return skip
+
 
 @dataclass
 class Usage:
@@ -197,13 +230,20 @@ class Analysis:
         models: PilotModels,
         elo_router: dict[str, Any] | None,
         seed: int = 0,
+        skip: set[str] | None = None,
     ) -> None:
-        """Compute all outcomes."""
+        """
+        Compute all outcomes.
+
+        Methods in skip are left out of the outcomes; the runner made no calls for them.
+        """
         self.raw = raw
         self.records = records
         self.models = models
         self.seed = seed
         self.elo_router = elo_router
+        self.skip = set(skip or ())
+        self.cascades = [name for name in CASCADES if name not in self.skip]
         self.labels = {m.id: m.label for m in models.models}
 
         self.outcomes: dict[str, dict[str, dict[str, Any]]] = {}
@@ -217,10 +257,10 @@ class Analysis:
         else:
             self.eval_records, self.eval_split = raw, "all (no test questions in this run)"
 
-        self.taus = {name: self._fit_tau(name) for name in CASCADES}
+        self.taus = {name: self._fit_tau(name) for name in self.cascades}
         for record in raw:
             outcomes = self.outcomes[record["id"]]
-            for name in CASCADES:
+            for name in self.cascades:
                 outcomes[name] = self._cascade(record, name, self.taus[name])
             if elo_router and elo_router.get("top_model"):
                 top = elo_router["top_model"].get(record["subset"])
@@ -240,6 +280,8 @@ class Analysis:
                 outcomes["best_single_oracle"] = dict(
                     outcomes[f"single:{self.labels[self.best_single_oracle]}"]
                 )
+            for name in self.skip:
+                outcomes.pop(name, None)
 
     def _outcome(
         self,
@@ -267,17 +309,22 @@ class Analysis:
         for name in [f"single:{m.label}" for m in self.models.models] + [
             "art_r1", "art_r2", "judge", "fusion", "jev_pick"
         ]:
-            outcomes[name] = self._outcome(record, methods[name]["answer"], methods[name]["groups"])
+            if name in methods:
+                outcomes[name] = self._outcome(
+                    record, methods[name]["answer"], methods[name]["groups"]
+                )
 
-        letters = [record["answers"][m]["letter"] for m in self.models.ids]
-        answer, tie, votes = majority_vote(letters, self.seed, record["id"])
-        answer_group = [record["answers"][m]["call"] for m in self.models.ids]
-        outcomes["majority_vote"] = {
-            **self._outcome(record, answer, [[k for k in answer_group if k]]),
-            "tie": tie,
-            "votes": votes,
-        }
-        outcomes["jev_pick"]["orderings_disagree"] = methods["jev_pick"]["orderings_disagree"]
+        if "majority_vote" not in self.skip:
+            letters = [record["answers"][m]["letter"] for m in self.models.ids]
+            answer, tie, votes = majority_vote(letters, self.seed, record["id"])
+            answer_group = [record["answers"][m]["call"] for m in self.models.ids]
+            outcomes["majority_vote"] = {
+                **self._outcome(record, answer, [[k for k in answer_group if k]]),
+                "tie": tie,
+                "votes": votes,
+            }
+        if "jev_pick" in outcomes:
+            outcomes["jev_pick"]["orderings_disagree"] = methods["jev_pick"]["orderings_disagree"]
         return outcomes
 
     def _cascade_inputs(self, records: list[dict[str, Any]], name: str) -> dict[str, list[Any]]:
@@ -335,13 +382,10 @@ class Analysis:
 
     def method_names(self) -> list[str]:
         """Methods in report order."""
-        names = [f"single:{m.label}" for m in self.models.models]
-        names += ["majority_vote", "art_r1", "art_r2", "judge", "fusion", "elo_router",
-                  "best_single_calibration", "best_single_oracle", "jev_pick", *CASCADES]
         present: set[str] = set()
         for outcomes in self.outcomes.values():
             present |= set(outcomes)
-        return [n for n in names if n in present]
+        return [n for n in all_methods(self.models) if n in present]
 
     def summary(self) -> list[dict[str, Any]]:
         """One row per method on the evaluation split."""
@@ -368,7 +412,7 @@ class Analysis:
                 "tau": "",
                 "notes": "",
             }
-            if name in CASCADES:
+            if name in self.cascades:
                 row["coverage"] = float(np.mean([o["accepted"] for o in outs]))
                 row["tau"] = self.taus[name]
                 row["notes"] = "tau fitted on calibration split"
@@ -392,7 +436,7 @@ class Analysis:
     def sweeps(self) -> dict[str, list[dict[str, float]]]:
         """Tau sweep 0..1 on the evaluation split for each cascade (not a tuned result)."""
         result = {}
-        for name in CASCADES:
+        for name in self.cascades:
             inputs = self._cascade_inputs(self.eval_records, name)
             result[name] = tau_sweep(
                 inputs["p"], inputs["cheap_correct"], inputs["escalated_correct"],
@@ -404,6 +448,8 @@ class Analysis:
         """Reliability table, Brier score and risk-coverage curve per gate on the eval split."""
         result = {}
         for name, gate in (("cascade_llm", "llm_judge"), ("cascade_jev", "jev")):
+            if name not in self.cascades:
+                continue
             inputs = self._cascade_inputs(self.eval_records, name)
             result[gate] = {
                 "reliability": reliability_table(inputs["p"], inputs["cheap_correct"]),

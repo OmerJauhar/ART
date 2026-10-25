@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 from art_framework.agents.base import AgentResponse, Critique
 from art_framework.tournament.engine import RoundResult, TournamentConfig, TournamentEngine
 from experiments.pilot.agents import PilotAgent
+from experiments.pilot.analysis import check_skip
 from experiments.pilot.data import Question
 from experiments.pilot.gateway import QUESTION_ID, STAGE, TRACE, CallRecord, Gateway
 from experiments.pilot.jev import JevClient
@@ -94,12 +95,23 @@ class QuestionRunner:
         models: PilotModels,
         jev: JevClient,
         seed: int = 0,
+        skip: set[str] | None = None,
     ) -> None:
-        """Create the runner."""
+        """
+        Create the runner.
+
+        Methods in skip (validated with check_skip) make no calls of their own; the four
+        answers are always made.
+        """
         self.gateway = gateway
         self.models = models
         self.jev = jev
         self.seed = seed
+        self.skip = check_skip(set(skip or ()), models)
+
+    def enabled(self, method: str) -> bool:
+        """Whether a method runs."""
+        return method not in self.skip
 
     def make_agents(self) -> dict[str, PilotAgent]:
         """Fresh agents (ELO 1500) for every model, keyed by model ID."""
@@ -199,6 +211,8 @@ class QuestionRunner:
 
         # 2. ART, one round then two rounds (round 1 of art_r2 is served from cache)
         for name, rounds in (("art_r1", 1), ("art_r2", 2)):
+            if not self.enabled(name):
+                continue
             art, trace, error = await traced(lambda r=rounds: self.run_tournament(question, r))
             methods[name] = {
                 "answer": art["answer"] if art else None,
@@ -207,33 +221,47 @@ class QuestionRunner:
                 **({k: v for k, v in art.items() if k != "answer"} if art else {}),
             }
 
-        # 3. Methods that build on the four answers, in parallel
-        judge_task = self._judge(question, text, answers, answer_group, judge_id)
-        fusion_task = self._fusion(question, text, answers, answer_group, judge_id)
-        jev_pick_task = self._jev_pick(question, text, answers, answer_group)
-        jev_gate_task = self._jev_gate(text, answers[cheap], answer_keys[cheap])
-        judge, fusion, jev_pick, jev_gate = await asyncio.gather(
-            judge_task, fusion_task, jev_pick_task, jev_gate_task
+        # 3. Methods that build on the four answers, in parallel. The LLM gate is the judge
+        # critiquing the cheap answer, so it is made even when judge itself is skipped.
+        judge_targets = list(self.models.ids) if self.enabled("judge") else (
+            [cheap] if self.enabled("cascade_llm") else []
         )
-        methods["judge"] = judge
-        methods["fusion"] = fusion
-        methods["jev_pick"] = jev_pick
+        tasks: dict[str, Awaitable[dict[str, Any]]] = {}
+        if judge_targets:
+            tasks["judge"] = self._judge(
+                question, text, answers, answer_group, judge_id, judge_targets
+            )
+        if self.enabled("fusion"):
+            tasks["fusion"] = self._fusion(question, text, answers, answer_group, judge_id)
+        if self.enabled("jev_pick"):
+            tasks["jev_pick"] = self._jev_pick(question, text, answers, answer_group)
+        if self.enabled("cascade_jev"):
+            tasks["jev_gate"] = self._jev_gate(text, answers[cheap], answer_keys[cheap])
+        done = dict(zip(tasks, await asyncio.gather(*tasks.values())))
+        for name in ("judge", "fusion", "jev_pick"):
+            if name in done and self.enabled(name):
+                methods[name] = done[name]
 
         # 4. Cascade components; accept/escalate is decided once tau is fitted
         cheap_group = [answer_keys[cheap]] if answer_keys[cheap] else []
-        llm_gate = judge["per_target"].get(cheap, {})
-        methods["cascade_llm"] = {
-            "cheap_answer": record["answers"][cheap]["letter"],
-            "p": llm_gate.get("p", 0.0),
-            "gate_error": llm_gate.get("error"),
-            "accept_groups": [cheap_group, [llm_gate["call"]] if llm_gate.get("call") else []],
-        }
-        methods["cascade_jev"] = {
-            "cheap_answer": record["answers"][cheap]["letter"],
-            "p": jev_gate["p"],
-            "gate_error": jev_gate["error"],
-            "accept_groups": [cheap_group, jev_gate["groups"]],
-        }
+        if self.enabled("cascade_llm"):
+            llm_gate = done["judge"]["per_target"].get(cheap, {})
+            methods["cascade_llm"] = {
+                "cheap_answer": record["answers"][cheap]["letter"],
+                "p": llm_gate.get("p", 0.0),
+                "gate_error": llm_gate.get("error"),
+                "accept_groups": [
+                    cheap_group, [llm_gate["call"]] if llm_gate.get("call") else []
+                ],
+            }
+        if self.enabled("cascade_jev"):
+            jev_gate = done["jev_gate"]
+            methods["cascade_jev"] = {
+                "cheap_answer": record["answers"][cheap]["letter"],
+                "p": jev_gate["p"],
+                "gate_error": jev_gate["error"],
+                "accept_groups": [cheap_group, jev_gate["groups"]],
+            }
         return record
 
     async def _judge(
@@ -243,10 +271,14 @@ class QuestionRunner:
         answers: dict[str, AgentResponse | None],
         answer_group: list[str],
         judge_id: str,
+        targets: list[str],
     ) -> dict[str, Any]:
-        """Judge model scores each answer with ART's critique prompt; pick the top OVERALL."""
+        """
+        Judge model scores each answer in targets with ART's critique prompt; pick the top
+        OVERALL.
+        """
         judge = self.make_agents()[judge_id]
-        targets = [m for m in self.models.ids if answers[m] is not None]
+        targets = [m for m in targets if answers[m] is not None]
         results = await asyncio.gather(*[
             traced(lambda m=m: judge.critique_response(text, answers[m]))  # type: ignore
             for m in targets
