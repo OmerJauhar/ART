@@ -19,7 +19,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from experiments.pilot.budget import BudgetGuard
+from experiments.pilot.budget import BudgetExceeded, BudgetGuard
 from experiments.pilot.cache import CachedCall, CallCache, request_key
 from experiments.pilot.settings import PilotModels
 
@@ -196,6 +196,8 @@ class Gateway:
         self.records: dict[str, CallRecord] = {}
         self.live_calls = 0
         self.live_spend = 0.0
+        # Questions with at least one call refused by the budget guard (incomplete)
+        self.refused_questions: set[str] = set()
 
     def chat_url(self) -> str:
         """Chat completions URL."""
@@ -234,23 +236,12 @@ class Gateway:
         cached = self.cache.get(key)
         served_from_cache = cached is not None
         if cached is None:
-            future = self._inflight.get(key)
-            if future is not None:
-                cached, _ = await asyncio.shield(future)
-                served_from_cache = True
-            else:
-                future = asyncio.get_running_loop().create_future()
-                self._inflight[key] = future
-                try:
-                    cached = await self._live_call(key, endpoint, url, model, body)
-                    future.set_result((cached, False))
-                except BaseException as e:
-                    future.set_exception(e)
-                    # Mark retrieved so an unawaited future does not warn
-                    future.exception()
-                    raise
-                finally:
-                    self._inflight.pop(key, None)
+            try:
+                cached, served_from_cache = await self._fetch(key, endpoint, url, model, body)
+            except BudgetExceeded:
+                if QUESTION_ID.get():
+                    self.refused_questions.add(QUESTION_ID.get())
+                raise
 
         prompt, completion, _ = _usage_numbers(endpoint, cached.response)
         record = self.records.get(key)
@@ -278,6 +269,38 @@ class Gateway:
             trace.append(record)
         return record
 
+    async def _fetch(
+        self,
+        key: str,
+        endpoint: str,
+        url: str,
+        model: str,
+        body: dict[str, Any],
+    ) -> tuple[CachedCall, bool]:
+        """
+        Make the live call, or wait for an identical one already in flight.
+
+        Returns:
+            (stored call, whether it came from another caller's call)
+        """
+        future = self._inflight.get(key)
+        if future is not None:
+            cached, _ = await asyncio.shield(future)
+            return cached, True
+        future = asyncio.get_running_loop().create_future()
+        self._inflight[key] = future
+        try:
+            cached = await self._live_call(key, endpoint, url, model, body)
+            future.set_result((cached, False))
+            return cached, False
+        except BaseException as e:
+            future.set_exception(e)
+            # Mark retrieved so an unawaited future does not warn
+            future.exception()
+            raise
+        finally:
+            self._inflight.pop(key, None)
+
     async def _live_call(
         self,
         key: str,
@@ -294,6 +317,13 @@ class Gateway:
                 start = time.perf_counter()
                 response = await self.transport.post(url, body)
                 latency_ms = (time.perf_counter() - start) * 1000
+        except ApiError as e:
+            await self.budget.release(worst_case)
+            if str(e.status) == "402":
+                # Out of OpenRouter credits: stop the run as if the budget guard had
+                self.budget.exhausted = True
+                raise BudgetExceeded(f"OpenRouter reports insufficient credits: {e}") from e
+            raise
         except BaseException:
             await self.budget.release(worst_case)
             raise
