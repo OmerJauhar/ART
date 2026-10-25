@@ -112,11 +112,13 @@ class ConsensusEngine:
         # Calculate weights based on ELO scores
         agent_weights = self._calculate_weights(responses, elo_scores)
         
-        # Filter by confidence threshold
+        # Filter by confidence threshold; unscored responses carry only a placeholder
+        # confidence, so they never pass
         filtered_responses = {
             agent_id: response
             for agent_id, response in responses.items()
             if response.confidence >= self.min_confidence_threshold
+            and response.metadata.get("confidence_source") != "unscored"
         }
         
         if not filtered_responses:

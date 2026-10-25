@@ -174,3 +174,51 @@ class TestConsensusEngine:
         assert "final_response" in result_dict
         assert "confidence" in result_dict
         assert "contributing_agents" in result_dict
+    
+    def test_unscored_responses_excluded(self) -> None:
+        """Test that unscored responses do not pass the confidence filter."""
+        responses = {
+            "scored": AgentResponse(
+                agent_id="scored",
+                query_id="test-query",
+                content="Peer-scored response.",
+                confidence=0.6,
+                metadata={"confidence_source": "peer_score"},
+            ),
+            "unscored": AgentResponse(
+                agent_id="unscored",
+                query_id="test-query",
+                content="Unscored response.",
+                confidence=0.5,
+                metadata={"confidence_source": "unscored"},
+            ),
+        }
+        
+        result = self.engine.generate_consensus(
+            responses=responses,
+            elo_scores={"scored": 1500, "unscored": 1900},
+            strategy=FusionStrategy.CONTEXTUAL_AGGREGATION,
+        )
+        
+        assert result.contributing_agents == ["scored"]
+    
+    def test_all_unscored_falls_back_to_all(self) -> None:
+        """Test that all responses are used when none pass the filter."""
+        responses = {
+            agent_id: AgentResponse(
+                agent_id=agent_id,
+                query_id="test-query",
+                content=f"Unscored response from {agent_id}.",
+                confidence=0.9,
+                metadata={"confidence_source": "unscored"},
+            )
+            for agent_id in ("agent_a", "agent_b")
+        }
+        
+        result = self.engine.generate_consensus(
+            responses=responses,
+            elo_scores={"agent_a": 1600, "agent_b": 1500},
+            strategy=FusionStrategy.CONTEXTUAL_AGGREGATION,
+        )
+        
+        assert sorted(result.contributing_agents) == ["agent_a", "agent_b"]
