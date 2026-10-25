@@ -316,6 +316,13 @@ class TournamentEngine:
         # Step 3: Calculate scores
         scores = self._calculate_scores(critiques, config)
         
+        # Confidence comes from peer scores; responses with no critiques keep theirs,
+        # since their score is only the default placeholder
+        for agent_id, response in responses.items():
+            if critiques.get(agent_id) and agent_id in scores:
+                response.confidence = scores[agent_id] / 100
+                response.metadata["confidence_source"] = "peer_score"
+        
         # Step 4: Update ELO ratings
         elo_updates = self._update_elo_ratings(scores)
         

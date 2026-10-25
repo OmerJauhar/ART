@@ -205,9 +205,13 @@ class LLMAgent(Agent):
                 agent_id=self.id,
                 query_id=query_id,
                 content=content,
-                confidence=0.85,  # Could be calculated based on model output
+                confidence=0.5,  # Neutral until the engine sets it from peer scores
                 reasoning=f"Generated using {self.config.model_name}",
-                metadata={"model": self.config.model_name, "usage": usage},
+                metadata={
+                    "model": self.config.model_name,
+                    "usage": usage,
+                    "confidence_source": "unscored",
+                },
                 latency_ms=latency_ms,
             )
         except Exception as e:
@@ -420,12 +424,13 @@ REASONING:
             agent_id=self.id,
             query_id=original_response.query_id,
             content=content,
-            confidence=min(0.95, original_response.confidence + 0.1),
+            confidence=0.5,  # Neutral until the engine sets it from peer scores
             reasoning="Improved based on peer critiques",
             metadata={
                 "model": self.config.model_name,
                 "critiques_incorporated": len(critiques),
                 "usage": usage,
+                "confidence_source": "unscored",
             },
             latency_ms=latency_ms,
         )
