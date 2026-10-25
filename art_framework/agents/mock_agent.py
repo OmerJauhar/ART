@@ -189,6 +189,8 @@ class MockAgent(Agent):
         self,
         original_response: AgentResponse,
         critiques: list[Critique],
+        *,
+        original_query: str | None = None,
     ) -> AgentResponse:
         """Improve a response based on received critiques."""
         await asyncio.sleep(random.uniform(*self.latency_range))

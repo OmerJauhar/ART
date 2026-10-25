@@ -311,7 +311,7 @@ class TournamentEngine:
         
         # Step 5: Improve responses if enabled
         if config.enable_response_improvement and round_number < config.rounds_per_tournament:
-            responses = await self._improve_responses(responses, critiques)
+            responses = await self._improve_responses(query, responses, critiques)
         
         # Determine best response
         best_agent_id = max(scores.items(), key=lambda x: x[1])[0]
@@ -474,6 +474,7 @@ class TournamentEngine:
     
     async def _improve_responses(
         self,
+        query: str,
         responses: dict[str, AgentResponse],
         critiques: dict[str, list[Critique]],
     ) -> dict[str, AgentResponse]:
@@ -487,7 +488,9 @@ class TournamentEngine:
             agent_critiques = critiques.get(agent_id, [])
             if agent_critiques:
                 agent = self.agents[agent_id]
-                tasks.append(agent.improve_response(response, agent_critiques))
+                tasks.append(
+                    agent.improve_response(response, agent_critiques, original_query=query)
+                )
                 agent_ids.append(agent_id)
             else:
                 improved_responses[agent_id] = response

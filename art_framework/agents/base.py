@@ -208,6 +208,8 @@ class Agent(ABC):
         self,
         original_response: AgentResponse,
         critiques: list[Critique],
+        *,
+        original_query: str | None = None,
     ) -> AgentResponse:
         """
         Improve a response based on received critiques.
@@ -215,6 +217,7 @@ class Agent(ABC):
         Args:
             original_response: The original response to improve
             critiques: List of critiques received from other agents
+            original_query: The question the response was answering
             
         Returns:
             Improved AgentResponse

@@ -369,6 +369,8 @@ REASONING:
         self,
         original_response: AgentResponse,
         critiques: list[Critique],
+        *,
+        original_query: str | None = None,
     ) -> AgentResponse:
         """Improve a response based on received critiques."""
         critique_summary = "\n".join([
@@ -379,6 +381,18 @@ REASONING:
             for c in critiques
         ])
         
+        question_section = (
+            f"ORIGINAL QUESTION:\n{original_query}\n\n" if original_query else ""
+        )
+        user_content = (
+            f"{question_section}"
+            f"YOUR PREVIOUS ANSWER:\n{original_response.content}\n\n"
+            f"CRITIQUES:\n{critique_summary}\n\n"
+            "Write a revised, complete answer to the original question. Address the "
+            "critiques while keeping the strengths they identified. Focus on accuracy, "
+            "completeness, and clarity. Reply with the revised answer only."
+        )
+        
         messages = [
             {
                 "role": "system",
@@ -388,18 +402,7 @@ REASONING:
                     "provide an improved response."
                 ),
             },
-            {
-                "role": "user",
-                "content": f"""Your previous response:
-{original_response.content}
-
-Critique feedback received:
-{critique_summary}
-
-Please provide an improved response that addresses the critiques while 
-maintaining the strengths identified. Focus on accuracy, completeness, 
-and clarity.""",
-            },
+            {"role": "user", "content": user_content},
         ]
         
         start_time = time.time()
