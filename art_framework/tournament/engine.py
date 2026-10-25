@@ -53,6 +53,7 @@ class RoundResult:
     best_response_agent_id: str
     timestamp: datetime = field(default_factory=datetime.utcnow)
     duration_ms: float = 0.0
+    failed_critiques: int = 0  # critiques that errored or could not be parsed
     
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -64,6 +65,7 @@ class RoundResult:
             "best_response_agent_id": self.best_response_agent_id,
             "timestamp": self.timestamp.isoformat(),
             "duration_ms": self.duration_ms,
+            "failed_critiques": self.failed_critiques,
         }
 
 
@@ -302,6 +304,14 @@ class TournamentEngine:
         
         # Step 2: Cross-evaluation
         critiques = await self._cross_evaluate(query, responses, config)
+        expected_critiques = len(responses) * (len(responses) - 1)
+        received_critiques = sum(len(c) for c in critiques.values())
+        failed_critiques = expected_critiques - received_critiques
+        if failed_critiques:
+            logger.warning(
+                f"Round {round_number}: {failed_critiques} of {expected_critiques} "
+                "critiques failed and were dropped"
+            )
         
         # Step 3: Calculate scores
         scores = self._calculate_scores(critiques, config)
@@ -328,6 +338,7 @@ class TournamentEngine:
             elo_updates=elo_updates,
             best_response_agent_id=best_agent_id,
             duration_ms=duration_ms,
+            failed_critiques=failed_critiques,
         )
     
     async def _generate_responses(

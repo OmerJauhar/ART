@@ -7,6 +7,7 @@ Real LLM agent implementation using OpenAI-compatible APIs.
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from typing import Any
@@ -21,6 +22,24 @@ from art_framework.agents.base import (
     Critique,
     CritiqueStrategy,
 )
+
+_SCORE_FIELDS = ("accuracy", "coherence", "completeness", "relevance", "overall")
+
+# "ACCURACY: 85", "**ACCURACY:** 85", "- Accuracy - 85", "ACCURACY: 85/100", "ACCURACY: 85.5"
+_SCORE_PATTERNS = {
+    name: re.compile(
+        rf"^[ \t]*(?:[-*•][ \t]+)?[*_]*{name}[*_]*[ \t]*[:\-–—][ \t]*[*_]*[ \t]*"
+        r"(\d+(?:\.\d+)?)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for name in _SCORE_FIELDS
+}
+
+_SECTION_PATTERN = re.compile(
+    r"^[#*_ \t]*(PROS|CONS|SUGGESTIONS|REASONING)[*_ \t]*:", re.IGNORECASE
+)
+
+_BULLET_CHARS = ("-", "*", "•")
 
 
 class LLMAgent(Agent):
@@ -307,61 +326,48 @@ REASONING:
         return {"system": system, "user": user}
     
     def _parse_critique_scores(self, content: str) -> dict[str, Any]:
-        """Parse critique scores from LLM response."""
-        scores: dict[str, Any] = {
-            "accuracy": 70.0,
-            "coherence": 70.0,
-            "completeness": 70.0,
-            "relevance": 70.0,
-            "overall": 70.0,
-            "pros": [],
-            "cons": [],
-            "suggestions": [],
-        }
+        """
+        Parse critique scores from LLM response.
         
-        lines = content.split("\n")
+        Each score field must appear at the start of a line, e.g. ``ACCURACY: 85``,
+        ``**ACCURACY:** 85``, ``Accuracy - 85`` or ``ACCURACY: 85/100``. The first
+        match per field is used and clamped to 0-100.
+        
+        Args:
+            content: Raw critique text from the model
+            
+        Returns:
+            Dict with the five scores plus pros, cons and suggestions lists
+            
+        Raises:
+            ValueError: If any score field is missing, so no fake score reaches ELO
+        """
+        scores: dict[str, Any] = {"pros": [], "cons": [], "suggestions": []}
+        
+        missing = []
+        for field_name, pattern in _SCORE_PATTERNS.items():
+            match = pattern.search(content)
+            if match is None:
+                missing.append(field_name.upper())
+            else:
+                scores[field_name] = min(100.0, max(0.0, float(match.group(1))))
+        if missing:
+            raise ValueError(f"Critique missing scores for: {', '.join(missing)}")
+        
         current_section = None
-        
-        for line in lines:
+        for line in content.split("\n"):
             line = line.strip()
             if not line:
                 continue
             
-            if "ACCURACY:" in line.upper():
-                try:
-                    scores["accuracy"] = float(line.split(":")[-1].strip())
-                except ValueError:
-                    pass
-            elif "COHERENCE:" in line.upper():
-                try:
-                    scores["coherence"] = float(line.split(":")[-1].strip())
-                except ValueError:
-                    pass
-            elif "COMPLETENESS:" in line.upper():
-                try:
-                    scores["completeness"] = float(line.split(":")[-1].strip())
-                except ValueError:
-                    pass
-            elif "RELEVANCE:" in line.upper():
-                try:
-                    scores["relevance"] = float(line.split(":")[-1].strip())
-                except ValueError:
-                    pass
-            elif "OVERALL:" in line.upper():
-                try:
-                    scores["overall"] = float(line.split(":")[-1].strip())
-                except ValueError:
-                    pass
-            elif "PROS:" in line.upper():
-                current_section = "pros"
-            elif "CONS:" in line.upper():
-                current_section = "cons"
-            elif "SUGGESTIONS:" in line.upper():
-                current_section = "suggestions"
-            elif "REASONING:" in line.upper():
-                current_section = None
-            elif line.startswith("-") and current_section:
-                scores[current_section].append(line[1:].strip())
+            header = _SECTION_PATTERN.match(line)
+            if header:
+                section = header.group(1).lower()
+                current_section = None if section == "reasoning" else section
+            elif current_section and line[0] in _BULLET_CHARS:
+                item = line.lstrip("".join(_BULLET_CHARS)).strip()
+                if item:
+                    scores[current_section].append(item)
         
         return scores
     
