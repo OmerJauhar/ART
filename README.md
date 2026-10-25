@@ -1,6 +1,6 @@
 # ART (Adaptive Response Tuning) Framework
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB)](https://python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB)](https://python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
@@ -52,7 +52,7 @@ ART enables developers to:
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.10+
 - PostgreSQL 14+ (optional, for persistence)
 - Redis (optional, for caching)
 
@@ -213,7 +213,6 @@ ART-Framework/
 │       ├── config.py     # Configuration
 │       └── logging.py    # Logging setup
 ├── tests/                # Unit tests
-├── research-paper/       # Research documentation
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -252,13 +251,18 @@ flowchart TD
 
 ## 🔬 Research
 
-See the [research paper](research-paper/ART_Framework_Research_Paper.md) for:
+Paper: [arXiv:2512.00617](https://arxiv.org/abs/2512.00617)
 
-- Technical foundations
-- ELO rating system mathematics
-- Multi-agent reasoning theory
-- Experimental results
-- Future research directions
+The paper's experiments used simulated (mock) agents with fixed quality parameters, not real
+language models. A rerun on real models is in progress.
+
+## 🔁 Changes since the paper (v1.0-paper)
+
+- Temperature 0 is now respected instead of being replaced by the default.
+- Token usage and cost are tracked per call and per agent.
+- The revision prompt now includes the original question.
+- Unparseable critiques now fail loudly instead of defaulting to a score of 70.
+- Response confidence now comes from peer scores instead of a hardcoded value.
 
 ## 📝 Example Usage
 
@@ -308,7 +312,7 @@ asyncio.run(main())
 
 ## 📄 License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
 
 ## 👥 Authors
 
@@ -323,7 +327,3 @@ December 2025
 - FastAPI team
 - The ELO rating system (Arpad Elo)
 - Multi-agent systems research community
-
----
-
-**Status**: ✅ Complete | RESTful API | Tournament Engine | ELO Ranking | Consensus Generation | Docker Ready
