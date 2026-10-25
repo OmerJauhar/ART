@@ -4,8 +4,8 @@ This harness measures accuracy against cost per question for ART, simpler ensemb
 gates that decide when the full ART tournament is needed. Every method runs on the same
 questions and reuses the same cached model calls.
 
-Nothing here has been run against paid APIs yet. Everything below was built and tested with the
-fake provider (`--dry-run`).
+A 5-question smoke test has been run against OpenRouter (2026-10-25, $1.37); everything else was
+built and tested with the fake provider (`--dry-run`).
 
 ## Quick start
 
@@ -22,13 +22,39 @@ echo 'OPENROUTER_API_KEY=sk-or-...' > experiments/pilot/.env
 # 2. Smoke test: 5 real questions, prints the projected cost of the full run
 python -m experiments.pilot.run --smoke --run-name smoke --max-usd 5
 
-# 3. Full run (reuses every call the smoke test already paid for)
+# 3. Projected cost of the run you are about to start, from the smoke test's calls (no API call)
+python -m experiments.pilot.run --run-name pilot-v1 --estimate-only
+
+# 4. Full run (reuses every call the smoke test already paid for)
 python -m experiments.pilot.run --run-name pilot-v1 --max-usd 40
 ```
 
-Other flags: `--limit N` (first N sampled questions), `--concurrency 8` (API calls in flight),
-`--question-concurrency 4`, `--seed 0`, `--cache PATH`, `--prepare-data` (redraw the sample and
-rewrite `sample_ids.json`).
+A smaller run on part of the same sample, e.g. the 50-question run without `art_r2`:
+
+```bash
+FLAGS="--subsets SeqQA,ProtocolQA --test-per-subset 15 --skip-methods art_r2"
+python -m experiments.pilot.run --run-name pilot-v1 $FLAGS --estimate-only
+python -m experiments.pilot.run --run-name pilot-v1 $FLAGS --max-usd 8.5
+```
+
+Selection and method flags:
+
+- `--subsets A,B`: keep only these subsets.
+- `--test-per-subset N`: keep every calibration question of the kept subsets plus the first N
+  test questions of each, in sample order. Nothing is resampled: questions keep their order,
+  index and split, so every call already in the cache is reused.
+- `--skip-methods a,b`: leave methods out. They make no calls of their own and are left out of
+  `summary.csv`, `per_question.jsonl`, the plots and the results README. The four answers are
+  always made. `art_r1` can only be skipped together with `cascade_llm`, `cascade_jev` and
+  `elo_router`, which need it. With `judge` skipped, `cascade_llm` still makes its gate call.
+- `--estimate-only`: print the projected cost of the run the other flags describe, then exit
+  without any API call (see [Projected cost](#projected-cost)).
+- `--smoke` and `--limit N` take the first 5 or N of the selected questions.
+
+All of these are recorded in `config.json` (`selection`) and the results README.
+
+Other flags: `--concurrency 8` (API calls in flight), `--question-concurrency 4`, `--seed 0`,
+`--cache PATH`, `--prepare-data` (redraw the sample and rewrite `sample_ids.json`).
 
 Before a paid run, check that the prices in `models.yaml` still match
 <https://openrouter.ai/api/v1/models>, and read the smoke test's output for empty answers or
@@ -54,7 +80,8 @@ Sample: 100 questions, seed 0, as equal across the three subsets as their sizes 
 Answer options are shuffled with a seed per question. `sample_ids.json` holds the exact IDs and
 correct letters; the run refuses to start if a fresh draw does not match it.
 
-Headline numbers are on the 70 test questions. Thresholds, the ELO router's ratings and
+Headline numbers are on the 70 test questions (or the selected ones; see the selection flags
+above). Thresholds, the ELO router's ratings and
 `best_single_calibration` are fitted on the calibration split only.
 
 Question text is not committed: LAB-Bench carries a canary asking that it not appear in training
@@ -145,15 +172,40 @@ sequence, using each call's recorded latency.
 ## Projected cost
 
 A full run makes 37 distinct calls per question: 4 answers, 24 critiques (12 per ART round),
-4 revisions, 1 judge self-critique, 1 fusion call and 3 Jev calls. The dry run prices these at
-the real per-token rates and projects **$28.70** for the 100 questions (Sonnet $11.22,
-GPT-6.1 $11.22, Gemini $5.70, DeepSeek $0.53, Jev $0.03). Critiques are about 75% of it.
+4 revisions, 1 judge self-critique, 1 fusion call and 3 Jev calls. Without `art_r2` it makes 21
+(no revisions and no round-2 critiques).
 
-That figure rests on assumptions the smoke test replaces with measurements: prompt tokens at
-3.2 characters per token, and completions of 350 to 450 visible tokens plus about 500 reasoning
-tokens per call at effort `low`. Completion tokens are about two thirds of the projected cost,
-so the real number moves roughly with reasoning length. If every call used all 4096 output
-tokens the run would cost $93.67; the budget guard stops it at `--max-usd` first.
+The projection (`--estimate-only`, and at the end of every run) is fitted on the calls already in
+the cache (`estimate.py`). The cache does not record what a call was for, so the cached questions
+are replayed through the pipeline with a transport that refuses every request. Cache hits come
+back labelled with their stage, and a refused request marks a question as not fully cached.
+Then, per stage (answer, critique, revision, fusion, Jev pick, Jev gate) and model:
+
+```
+cost per call = multiplier * (completion_tokens * output_price
+                              + (overhead_tokens + question_tokens) * input_price)
+```
+
+- `completion_tokens`: mean visible plus reasoning tokens of the cached calls.
+- `overhead_tokens`: mean prompt tokens besides the question (templates, the answers being
+  critiqued or fused).
+- `question_tokens`: the question's length in characters times the model's measured tokens per
+  character for that subset (from its answer calls). DNA-heavy SeqQA questions take about twice
+  as many tokens per character as ProtocolQA prose.
+- `multiplier`: billed cost over list-price cost for that model. OpenRouter sometimes routes
+  DeepSeek to providers priced above its list price (×3.2 in the smoke test).
+
+The judge's critiques are priced as critiques by the judge model. The run total counts each
+distinct call once. Per-method figures count each method as if it ran alone. Methods whose cost
+depends on run-time choices (the ELO router and best-single picks, and the cascades' accept rate)
+are shown at their most expensive case, with the cheapest in a note. Questions already fully in
+the cache cost nothing new.
+
+On the smoke test's 185 calls, the 50-question run above without `art_r2` projects **$7.18**,
+of which $6.63 is new spend (4 of the 50 questions are already cached). For those 4 questions
+the fit gives $0.54 against $0.51 actually billed. The main uncertainty is completion length:
+Gemini's answers in the smoke test ranged from 440 to 4065 tokens, and five questions is a small
+basis.
 
 ## Reproducibility
 
@@ -169,10 +221,17 @@ tokens the run would cost $93.67; the budget guard stops it at `--max-usd` first
 - Cache: SQLite at `cache/calls.sqlite` (dry runs use `cache/calls_dryrun.sqlite`), keyed by a
   hash of the endpoint and request body. Reruns are free.
 - Budget guard: `--max-usd` (default 40) caps all live spend recorded in the cache file, across
-  runs, for LLM and Jev calls together. Before each uncached call the guard reserves that call's
+  runs, for LLM and Jev calls together. The smoke test's spend counts toward it, so to allow X
+  dollars of new spend pass the amount already recorded plus X (both are printed at the start
+  of a run and by `--estimate-only`). Before each uncached call the guard reserves that call's
   worst case (prompt size at 2 characters per token plus `max_tokens` of output); if that would
-  cross the cap, the call is refused, unfinished questions are dropped, and the outputs cover
-  the questions that finished.
+  cross the cap, the call is refused and no new question starts. An HTTP 402 from OpenRouter
+  (out of credits) stops the run the same way.
+- Partial runs: questions with a refused call are dropped as incomplete, and every output
+  (`summary.csv`, plots, `per_question.jsonl`, `config.json`) is still written for the questions
+  that finished. The results README then says "partial: X of Y questions". Calibration
+  questions all run before any test question, so a stopped run still has the calibration split
+  that the thresholds and the ELO router are fitted on.
 - Async, at most 8 concurrent calls, exponential backoff on 429 and 5xx (honouring
   `Retry-After`), 120 s timeout.
 - The API key is read from `OPENROUTER_API_KEY` or `experiments/pilot/.env` and is only ever
@@ -183,7 +242,7 @@ tokens the run would cost $93.67; the budget guard stops it at `--max-usd` first
 
 | File | Contents |
 |---|---|
-| `config.json` | models, prices, roles, Jev version, seed, split, taus, ELO router ratings, date, git commit, spend |
+| `config.json` | models, prices, roles, Jev version, seed, split, selection flags, taus, ELO router ratings, date, git commit, spend, status (complete or partial), cost projection |
 | `questions.jsonl` | ID, subset, options, correct letter, split |
 | `calls.jsonl` | every call: model, version, prompt hash, response, usage, latency |
 | `per_question.jsonl` | each method's answer, correctness, cost, calls; ART round-by-round records (answers, critiques, scores, ELO before/after); cascade p and accept/escalate |
