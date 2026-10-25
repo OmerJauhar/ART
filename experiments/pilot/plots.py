@@ -90,9 +90,9 @@ def accuracy_vs_cost(
             r["method"] + (" (oracle)" if r["method"] == "best_single_oracle" else "")
             for r in rows
         ]
-        # Stagger labels of nearby points (within ~0.15 decades and 2 points of accuracy)
+        # Stagger labels of nearby points (within ~0.3 decades and 2 points of accuracy)
         x = math.log10(cost)
-        slot = sum(1 for px, py, _ in placed if abs(px - x) < 0.15 and abs(py - accuracy) < 0.02)
+        slot = sum(1 for px, py, _ in placed if abs(px - x) < 0.3 and abs(py - accuracy) < 0.02)
         placed.append((x, accuracy, slot))
         ax.annotate(" = ".join(names), (cost, accuracy), textcoords="offset points",
                     xytext=(6, 4 - 11 * slot), fontsize=8)
