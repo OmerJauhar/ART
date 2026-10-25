@@ -263,6 +263,8 @@ language models. A rerun on real models is in progress.
 - The revision prompt now includes the original question.
 - Unparseable critiques now fail loudly instead of defaulting to a score of 70.
 - Response confidence now comes from peer scores instead of a hardcoded value.
+- Revised answers are now carried into the next round and re-scored; in v1.0-paper each round
+  regenerated fresh answers, so revisions never affected scores or ELO.
 
 ## 📝 Example Usage
 
