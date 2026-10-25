@@ -1,0 +1,6 @@
+# Downloaded benchmark data, API cache and run outputs stay local.
+# LAB-Bench carries a canary asking that its questions not appear in training corpora.
+data/
+cache/
+results/
+.env
