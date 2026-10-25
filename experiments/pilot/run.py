@@ -6,7 +6,10 @@ Command-line entry point for the real-model pilot.
 
     python -m experiments.pilot.run --dry-run                 # fake provider, 100 questions
     python -m experiments.pilot.run --smoke --run-name smoke  # 5 real questions + projection
+    python -m experiments.pilot.run --run-name pilot-v1 --estimate-only  # projection, no calls
     python -m experiments.pilot.run --run-name pilot-v1       # full real run
+
+--subsets, --test-per-subset and --skip-methods restrict the run to part of the same sample.
 
 See experiments/pilot/README.md.
 """
@@ -17,7 +20,6 @@ import argparse
 import asyncio
 import csv
 import json
-import math
 import os
 import subprocess
 import sys
@@ -28,16 +30,16 @@ from typing import Any
 from loguru import logger
 
 from experiments.pilot import data as pilot_data
-from experiments.pilot.analysis import NEVER_ACCEPT_TAU, Analysis
+from experiments.pilot.analysis import NEVER_ACCEPT_TAU, Analysis, check_skip
 from experiments.pilot.budget import BudgetExceeded, BudgetGuard
 from experiments.pilot.cache import CallCache
 from experiments.pilot.data import Question
+from experiments.pilot.estimate import Estimate, estimate_from_cache, format_estimate
 from experiments.pilot.fake_provider import FakeTransport
 from experiments.pilot.gateway import QUESTION_ID, Gateway, HttpTransport
 from experiments.pilot.jev import JevClient
 from experiments.pilot.methods import QuestionRunner
 from experiments.pilot.plots import accuracy_vs_cost, gate_reliability
-from experiments.pilot.prompts import format_question
 from experiments.pilot.settings import (
     PILOT_DIR,
     RESULTS_DIR,
@@ -58,8 +60,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true",
                         help="Use the fake provider for LLM and Jev calls (no OpenRouter traffic)")
     parser.add_argument("--smoke", action="store_true",
-                        help=f"Run {SMOKE_SIZE} questions and print the projected full-run cost")
-    parser.add_argument("--limit", type=int, help="Run only the first N sampled questions")
+                        help=f"Run the first {SMOKE_SIZE} selected questions and print the "
+                        "projected cost of the selected run")
+    parser.add_argument("--limit", type=int, help="Run only the first N selected questions")
+    parser.add_argument("--subsets", type=_csv,
+                        help="Comma-separated subsets to keep, e.g. SeqQA,ProtocolQA")
+    parser.add_argument("--test-per-subset", type=int,
+                        help="Keep every calibration question of the kept subsets plus the "
+                        "first N test questions of each, in sample order")
+    parser.add_argument("--skip-methods", type=_csv, default=[],
+                        help="Comma-separated methods to leave out, e.g. art_r2; they make no "
+                        "calls and are left out of every output")
+    parser.add_argument("--estimate-only", action="store_true",
+                        help="Print the projected cost of the run these flags describe, from "
+                        "calls already in the cache, and exit without any API call")
     parser.add_argument("--max-usd", type=float, default=40.0,
                         help="Hard cap on live spend recorded in the cache file (default 40)")
     parser.add_argument("--concurrency", type=int, default=8, help="Max concurrent API calls")
@@ -70,6 +84,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prepare-data", action="store_true",
                         help="Download LAB-Bench, draw the sample, write sample_ids.json, exit")
     return parser.parse_args(argv)
+
+
+def _csv(value: str) -> list[str]:
+    """Split a comma-separated flag value."""
+    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def git_commit() -> str:
@@ -191,18 +210,47 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def projected_cost(analysis: Analysis, done: list[Question], everything: list[Question]) -> float:
+def select_run(
+    args: argparse.Namespace,
+    sample: list[Question],
+    models: PilotModels,
+) -> tuple[list[Question], list[Question], set[str]]:
     """
-    Full-run cost projected from the questions run so far.
+    Apply the selection flags.
 
-    Every call carries the question text, so cost is scaled by question length: total cost
-    so far per character of question text, times the characters in the full sample.
+    Returns:
+        (questions the flags select before --smoke/--limit, questions to run, methods to skip)
     """
-    raw_by_id = {r["id"]: r for r in analysis.raw}
-    spent = sum(analysis.unique_cost(raw_by_id[q.id]) for q in done if q.id in raw_by_id)
-    done_chars = sum(len(format_question(q)) for q in done if q.id in raw_by_id)
-    all_chars = sum(len(format_question(q)) for q in everything)
-    return spent / done_chars * all_chars if done_chars else float("nan")
+    try:
+        planned = pilot_data.select_questions(sample, args.subsets, args.test_per_subset)
+        skip = check_skip(set(args.skip_methods), models)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+    questions = planned
+    if args.smoke:
+        questions = questions[:SMOKE_SIZE]
+    if args.limit is not None:
+        questions = questions[: args.limit]
+    return planned, questions, skip
+
+
+def split_counts(questions: list[Question]) -> dict[str, dict[str, int]]:
+    """Questions per split and subset."""
+    counts: dict[str, dict[str, int]] = {}
+    for q in questions:
+        counts.setdefault(q.split, {}).setdefault(q.subset, 0)
+        counts[q.split][q.subset] += 1
+    return counts
+
+
+def selection_text(config: dict[str, Any]) -> str:
+    """One line describing the selection flags."""
+    selection = config["selection"]
+    subsets = ", ".join(selection["subsets"]) if selection["subsets"] else "all"
+    per_subset = selection["test_per_subset"]
+    tests = "all" if per_subset is None else f"first {per_subset} per subset"
+    skipped = ", ".join(selection["skip_methods"]) or "none"
+    return f"subsets {subsets}; test questions {tests}; skipped methods {skipped}"
 
 
 def per_question_rows(analysis: Analysis, questions: list[Question]) -> list[dict[str, Any]]:
@@ -246,17 +294,33 @@ def results_readme(
             "",
         ]
     status = config["status"]
+    if status["state"] == "partial":
+        state = (
+            f"partial: {status['completed_questions']} of {status['requested_questions']} "
+            "questions (stopped by the budget guard)"
+        )
+    else:
+        state = f"complete ({status['completed_questions']} of {status['requested_questions']} "
+        state += "questions)"
+    projection = config["projection"]
+    if projection:
+        projection_line = (
+            f"- Projected cost of the selected {projection['questions']}-question run "
+            f"(measured per-call costs): ${projection['total_usd']:.2f}, of which "
+            f"${projection['new_usd']:.2f} is not yet in the cache"
+        )
+    else:
+        projection_line = "- Projected cost: not available (no cached calls to fit from)"
     lines += [
         f"- Date: {config['date']}",
         f"- Git commit: `{config['git_commit']}`",
-        f"- Status: {status['state']} ({status['completed_questions']} of "
-        f"{status['requested_questions']} questions completed)",
+        f"- Status: {state}",
+        f"- Selection: {selection_text(config)}",
         f"- Evaluation split: {config['evaluation_split']}",
         f"- Live spend this run: ${status['live_spend_usd']:.4f} over {status['live_calls']} calls",
         f"- Cost of all calls used by this run (including cache hits): "
         f"${status['cost_of_calls_used_usd']:.4f}",
-        f"- Projected cost of the full {pilot_data.SAMPLE_SIZE}-question run: "
-        f"${status['projected_full_run_usd']:.2f}",
+        projection_line,
         "",
         "## Summary",
         "",
@@ -272,13 +336,15 @@ def results_readme(
             f"| {row['mean_calls_per_question']:.1f} | {row['mean_latency_ms']:.0f} "
             f"| {row['unparseable']} | {coverage} | {row['notes']} |"
         )
-    lines += ["", "## Cascade thresholds (fitted on the calibration split)", ""]
-    for name, tau in config["taus"].items():
-        note = " (never accept: always escalate)" if tau == NEVER_ACCEPT_TAU else ""
-        lines.append(f"- {name}: tau = {tau:.4f}{note}")
-    lines += ["", "## Gate calibration (evaluation split)", ""]
-    for gate, data in calibration.items():
-        lines.append(f"- {gate}: Brier = {data['brier']:.4f} (n = {data['n']})")
+    if config["taus"]:
+        lines += ["", "## Cascade thresholds (fitted on the calibration split)", ""]
+        for name, tau in config["taus"].items():
+            note = " (never accept: always escalate)" if tau == NEVER_ACCEPT_TAU else ""
+            lines.append(f"- {name}: tau = {tau:.4f}{note}")
+    if calibration:
+        lines += ["", "## Gate calibration (evaluation split)", ""]
+        for gate, data in calibration.items():
+            lines.append(f"- {gate}: Brier = {data['brier']:.4f} (n = {data['n']})")
     lines += [
         "",
         "Latency is idealized: calls in the same step are assumed to run in parallel, using "
@@ -295,11 +361,12 @@ async def run(args: argparse.Namespace) -> int:
     """Run the pilot; return a process exit code."""
     models = load_models()
     all_questions, usable = load_sample(args.seed)
-    questions = all_questions
-    if args.smoke:
-        questions = questions[:SMOKE_SIZE]
-    if args.limit is not None:
-        questions = questions[: args.limit]
+    planned, questions, skip = select_run(args, all_questions, models)
+
+    default_cache = "calls_dryrun.sqlite" if args.dry_run else "calls.sqlite"
+    cache_path = args.cache or CACHE_DIR / default_cache
+    if args.estimate_only:
+        return await estimate_only(args, all_questions, questions, models, cache_path, skip)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_name = args.run_name or f"{'dryrun' if args.dry_run else 'run'}-{stamp}"
@@ -308,8 +375,6 @@ async def run(args: argparse.Namespace) -> int:
     logger.remove()
     logger.add(out_dir / "run.log", level="INFO")
 
-    default_cache = "calls_dryrun.sqlite" if args.dry_run else "calls.sqlite"
-    cache_path = args.cache or CACHE_DIR / default_cache
     cache = CallCache(cache_path)
     budget = BudgetGuard(args.max_usd, already_spent=cache.total_cost())
     if args.dry_run:
@@ -323,10 +388,12 @@ async def run(args: argparse.Namespace) -> int:
         transport = HttpTransport(api_key)
     gateway = Gateway(transport, cache, budget, models, concurrency=args.concurrency)
     jev = JevClient(gateway, models.jev.model, models.jev.fallback_model)
-    runner = QuestionRunner(gateway, models, jev, seed=args.seed)
+    runner = QuestionRunner(gateway, models, jev, seed=args.seed, skip=skip)
 
     mode = "DRY RUN (fake provider)" if args.dry_run else "LIVE (OpenRouter)"
     print(f"{mode}: {len(questions)} questions -> {out_dir}")
+    if skip:
+        print(f"Skipping methods: {', '.join(sorted(skip))}")
     print(f"Budget ${args.max_usd:.2f}; already recorded in {cache_path.name}: "
           f"${budget.spent:.4f}")
 
@@ -342,39 +409,47 @@ async def run(args: argparse.Namespace) -> int:
                 record = await runner.run(question)
             except BudgetExceeded:
                 return None
-            if budget.exhausted:
-                # A call for this question may have been refused; drop it as incomplete
+            if question.id in gateway.refused_questions:
+                # The budget guard refused one of this question's calls: incomplete
                 return None
             finished += 1
             print(f"  [{finished}/{len(questions)}] {question.subset:<16} {question.split:<11} "
                   f"live calls {gateway.live_calls:>5}  spend ${gateway.live_spend:.4f}")
             return record
 
+    # Calibration questions first, so a run stopped by the budget guard still has the
+    # calibration split that the cascade thresholds and the ELO router are fitted on
+    results: list[dict[str, Any] | None] = []
     try:
-        results = await asyncio.gather(*[process(q) for q in questions])
+        for split in ("calibration", "test"):
+            results += await asyncio.gather(*[process(q) for q in questions if q.split == split])
     finally:
         if isinstance(transport, HttpTransport):
             await transport.close()
+    ordered = [q for split in ("calibration", "test") for q in questions if q.split == split]
     raw = [r for r in results if r is not None]
-    done = [q for q, r in zip(questions, results) if r is not None]
-    stopped = budget.exhausted
+    done = [q for q, r in zip(ordered, results) if r is not None]
+    stopped = budget.exhausted and len(raw) < len(questions)
     if stopped:
-        print(f"Budget guard stopped the run after {len(raw)} complete questions.")
+        print(f"Budget guard stopped the run after {len(raw)} of {len(questions)} questions.")
 
     calibration_done = [q for q in done if q.split == "calibration"]
     elo_router = None
-    if calibration_done and not budget.exhausted:
-        try:
-            elo_router = await fit_elo_router(runner, calibration_done, models)
-        except BudgetExceeded:
-            print("Budget guard stopped the ELO router fit.")
+    if calibration_done and "elo_router" not in skip:
+        # Replays cached art_r1 tournaments, so it runs even after the budget guard stopped
+        elo_router = await fit_elo_router(runner, calibration_done, models)
 
-    analysis = Analysis(raw, gateway.records, models, elo_router, seed=args.seed)
+    analysis = Analysis(raw, gateway.records, models, elo_router, seed=args.seed, skip=skip)
     summary = analysis.summary()
     sweeps = analysis.sweeps()
     calibration = analysis.gate_calibration()
-    projection = projected_cost(analysis, done, all_questions)
     used_cost = sum(analysis.unique_cost(r) for r in raw)
+    try:
+        estimate: Estimate | None = await estimate_from_cache(
+            all_questions, planned, models, cache, args.seed, skip
+        )
+    except ValueError:
+        estimate = None
 
     versions: dict[str, set[str]] = {}
     for record in gateway.records.values():
@@ -382,11 +457,6 @@ async def run(args: argparse.Namespace) -> int:
     jev_versions = sorted({
         v for m, vs in versions.items() if m.startswith("typesafe/") for v in vs
     })
-    split_counts: dict[str, dict[str, int]] = {}
-    for q in all_questions:
-        split_counts.setdefault(q.split, {}).setdefault(q.subset, 0)
-        split_counts[q.split][q.subset] += 1
-
     config = {
         "run_name": run_name,
         "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -401,10 +471,20 @@ async def run(args: argparse.Namespace) -> int:
             "seqqa_subtasks_excluded": list(pilot_data.EXCLUDED_SEQQA_SUBTASKS),
             "usable_text_only": usable,
             "sample_size": pilot_data.SAMPLE_SIZE,
-            "split_counts": split_counts,
+            "split_counts": split_counts(all_questions),
         },
         "seed": args.seed,
         "split": {"calibration": "first 30 sampled", "test": "last 70 sampled"},
+        "selection": {
+            "subsets": args.subsets,
+            "test_per_subset": args.test_per_subset,
+            "skip_methods": sorted(skip),
+            "smoke": args.smoke,
+            "limit": args.limit,
+            "selected_split_counts": split_counts(planned),
+            "run_split_counts": split_counts(questions),
+            "note": "selection keeps the sample's order, indices and splits (no resampling)",
+        },
         "evaluation_split": analysis.eval_split,
         "models": [
             {
@@ -434,15 +514,16 @@ async def run(args: argparse.Namespace) -> int:
         "best_single_oracle": analysis.best_single_oracle,
         "budget": {"max_usd": args.max_usd, "cache_file": str(cache_path.name)},
         "status": {
-            "state": "stopped by budget guard" if stopped else "complete",
+            "state": "partial" if stopped else "complete",
             "requested_questions": len(questions),
             "completed_questions": len(raw),
+            "completed_by_split": split_counts(done),
             "live_calls": gateway.live_calls,
             "live_spend_usd": gateway.live_spend,
             "cost_of_calls_used_usd": used_cost,
-            "projected_full_run_usd": projection,
             "total_recorded_in_cache_usd": cache.total_cost(),
         },
+        "projection": projection_config(estimate),
     }
 
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, default=_json_default))
@@ -477,13 +558,68 @@ async def run(args: argparse.Namespace) -> int:
               f"{row['mean_usd_per_question']:>10.4f}{row['mean_calls_per_question']:>9.1f}"
               f"{row['unparseable']:>9}")
     print()
-    print(f"Taus (calibration): " + ", ".join(f"{k}={v:.3f}" for k, v in analysis.taus.items()))
+    print("Taus (calibration): " + ", ".join(f"{k}={v:.3f}" for k, v in analysis.taus.items()))
     print(f"Live spend this run: ${gateway.live_spend:.4f} ({gateway.live_calls} calls)")
-    if not math.isnan(projection):
-        print(f"Projected cost of the full {pilot_data.SAMPLE_SIZE}-question run: "
-              f"${projection:.2f}")
+    if stopped:
+        print(f"PARTIAL: {len(raw)} of {len(questions)} questions completed "
+              f"({split_counts(done)}); outputs cover the completed questions.")
+    if estimate:
+        print(f"Projected cost of the selected {estimate.n_questions}-question run: "
+              f"${estimate.total_usd:.2f} total, ${estimate.new_usd:.2f} not yet in the cache "
+              "(details: --estimate-only)")
     print(f"Outputs: {out_dir}")
     return 1 if stopped else 0
+
+
+def projection_config(estimate: Estimate | None) -> dict[str, Any] | None:
+    """The projection as stored in config.json."""
+    if estimate is None:
+        return None
+    return {
+        "method": "measured per-call costs by stage and model (experiments/pilot/estimate.py)",
+        "questions": estimate.n_questions,
+        "total_usd": estimate.total_usd,
+        "new_usd": estimate.new_usd,
+        "cached_questions": len(estimate.cached_questions),
+        "by_stage_usd": estimate.by_stage,
+        "by_model_usd": estimate.by_model,
+        "methods": estimate.methods,
+        "fitted_on_calls": estimate.cost_model.n_calls,
+    }
+
+
+async def estimate_only(
+    args: argparse.Namespace,
+    sample: list[Question],
+    questions: list[Question],
+    models: PilotModels,
+    cache_path: Path,
+    skip: set[str],
+) -> int:
+    """Print the projected cost of the selected run from the cache; makes no API call."""
+    if not cache_path.exists():
+        print(f"No cache at {cache_path}; run --smoke first.", file=sys.stderr)
+        return 2
+    logger.remove()
+    cache = CallCache(cache_path)
+    try:
+        estimate = await estimate_from_cache(sample, questions, models, cache, args.seed, skip)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    finally:
+        recorded = cache.total_cost()
+        cache.close()
+    counts = split_counts(questions)
+    print(f"ESTIMATE ONLY (no API calls), cache {cache_path.name}"
+          + (" [DRY RUN cache: fake responses]" if args.dry_run else ""))
+    print(f"Run name: {args.run_name or '(none)'}")
+    print(f"Questions: {len(questions)} ({', '.join(f'{s}: {c}' for s, c in counts.items())})")
+    print(f"Methods: {', '.join(m['method'] for m in estimate.methods)}")
+    print(f"Skipped: {', '.join(sorted(skip)) or 'none'}")
+    print()
+    print(format_estimate(estimate, args.max_usd, recorded))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
