@@ -1,7 +1,7 @@
 {
   "run_name": "pilot-v1",
-  "date": "2026-10-26T14:16:39+00:00",
-  "git_commit": "6d457d1ed6720202d6a289409e55d79a2fccec9b",
+  "date": "2026-10-26T14:30:11+00:00",
+  "git_commit": "eb83c3e2ee62c80c6c2d628bf9803b7fa1c2fc9e",
   "command": "python -m experiments.pilot.run --run-name pilot-v1 --subsets SeqQA,ProtocolQA --test-per-subset 15 --skip-methods art_r2 --max-usd 7.0",
   "dry_run": false,
   "dataset": {

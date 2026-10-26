@@ -1,7 +1,7 @@
 # Pilot results: pilot-v1
 
-- Date: 2026-10-26T14:16:39+00:00
-- Git commit: `6d457d1ed6720202d6a289409e55d79a2fccec9b`
+- Date: 2026-10-26T14:30:11+00:00
+- Git commit: `eb83c3e2ee62c80c6c2d628bf9803b7fa1c2fc9e`
 - Status: complete (50 of 50 questions)
 - Selection: subsets SeqQA, ProtocolQA; test questions first 15 per subset; skipped methods art_r2
 - Evaluation split: test
