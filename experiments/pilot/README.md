@@ -54,7 +54,8 @@ Selection and method flags:
 All of these are recorded in `config.json` (`selection`) and the results README.
 
 Other flags: `--concurrency 8` (API calls in flight), `--question-concurrency 4`, `--seed 0`,
-`--cache PATH`, `--prepare-data` (redraw the sample and rewrite `sample_ids.json`).
+`--cache PATH`, `--retry-refusals` (see [Provider refusals](#provider-refusals)),
+`--prepare-data` (redraw the sample and rewrite `sample_ids.json`).
 
 Before a paid run, check that the prices in `models.yaml` still match
 <https://openrouter.ai/api/v1/models>, and read the smoke test's output for empty answers or
@@ -151,7 +152,24 @@ and usage accounting are unchanged. The question text given to agents includes t
 the `ANSWER: <letter>` instruction, so revised answers keep that format.
 
 Answers are read from the last `ANSWER: X` line (uppercase letter, valid for the question).
-Anything else counts as wrong and is counted as unparseable per method.
+Anything else counts as wrong and is counted as unparseable per method, except a missing answer
+caused by a provider refusal, which also counts as wrong but is counted as refused.
+
+### Provider refusals
+
+OpenRouter passes through OpenAI's HTTP 403 "This content was flagged for possible biological
+risk..." on some LAB-Bench prompts. The classifier (`is_provider_refusal` in `gateway.py`) is
+deliberately narrow: an HTTP 403 whose body says the content was flagged. Nothing else counts.
+
+- A refusal is cached as a deterministic outcome at cost 0, so a rerun replays it instead of
+  asking again. `--retry-refusals` sends each cached refusal once more and caches the new
+  outcome.
+- `summary.csv` and the results README have a `refused` column next to `unparseable`. A
+  refused answer counts as wrong, exactly like an unparseable one.
+- The results README lists the refused calls by model and stage, and a "Dropped critiques"
+  table: critiques left out of ART's scoring (and the judge's failed critiques) by critic and
+  cause (refused, unparseable, other). Each ART round in `per_question.jsonl` lists its dropped
+  critiques with critic, target and cause.
 
 ## Cost accounting
 
@@ -246,11 +264,11 @@ basis.
 | `questions.jsonl` | ID, subset, options, correct letter, split |
 | `calls.jsonl` | every call: model, version, prompt hash, response, usage, latency |
 | `per_question.jsonl` | each method's answer, correctness, cost, calls; ART round-by-round records (answers, critiques, scores, ELO before/after); cascade p and accept/escalate |
-| `summary.csv` | per method: accuracy with bootstrap 95% CI, USD/question, calls/question, tokens, latency, unparseable count, coverage |
+| `summary.csv` | per method: accuracy with bootstrap 95% CI, USD/question, calls/question, tokens, latency, unparseable and refused counts, coverage |
 | `tau_sweep.csv` | both cascades' accuracy, cost and coverage for tau 0..1 on the test split |
 | `gate_calibration.csv`, `gate_risk_coverage.csv`, `gate_reliability.png` | reliability deciles, Brier score and risk-coverage for both gates |
 | `accuracy_vs_cost.png` / `.svg` | accuracy (with CI) vs mean USD/question on a log axis, plus the cascade sweeps |
-| `README.md`, `run.log` | short results summary with total spend; full log |
+| `README.md`, `run.log` | short results summary with total spend, provider refusals and dropped critiques; full log |
 
 ## Tests
 

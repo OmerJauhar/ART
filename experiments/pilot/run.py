@@ -74,6 +74,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--estimate-only", action="store_true",
                         help="Print the projected cost of the run these flags describe, from "
                         "calls already in the cache, and exit without any API call")
+    parser.add_argument("--retry-refusals", action="store_true",
+                        help="Send requests whose cached outcome is a provider refusal again, "
+                        "instead of replaying the refusal")
     parser.add_argument("--max-usd", type=float, default=40.0,
                         help="Hard cap on live spend recorded in the cache file (default 40)")
     parser.add_argument("--concurrency", type=int, default=8, help="Max concurrent API calls")
@@ -278,6 +281,29 @@ def per_question_rows(analysis: Analysis, questions: list[Question]) -> list[dic
     return rows
 
 
+def refusal_rows(
+    gateway: Gateway,
+    done: list[Question],
+    models: PilotModels,
+) -> list[dict[str, Any]]:
+    """Distinct provider-refused calls for the completed questions, by model, stage and split."""
+    split_of = {q.id: q.split for q in done}
+    labels = {m.id: m.label for m in models.models}
+    counts: dict[tuple[str, str], dict[str, int]] = {}
+    for refusal in gateway.refusals.values():
+        splits = {split_of[qid] for qid in refusal["question_ids"] if qid in split_of}
+        if not splits:
+            continue
+        # A call shared by questions of both splits (not expected) counts as calibration
+        split = "calibration" if "calibration" in splits else "test"
+        model = labels.get(refusal["model"], refusal["model"])
+        row = counts.setdefault((model, refusal["stage"]), {"calibration": 0, "test": 0})
+        row[split] += 1
+    order = {m.label: i for i, m in enumerate(models.models)}
+    ordered = sorted(counts.items(), key=lambda kv: (order.get(kv[0][0], len(order)), kv[0][1]))
+    return [{"model": model, "stage": stage, **row} for (model, stage), row in ordered]
+
+
 def results_readme(
     run_name: str,
     config: dict[str, Any],
@@ -324,9 +350,9 @@ def results_readme(
         "",
         "## Summary",
         "",
-        "| method | n | accuracy [95% CI] | USD/q | calls/q | latency ms | unparseable | coverage "
-        "| notes |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| method | n | accuracy [95% CI] | USD/q | calls/q | latency ms | unparseable | refused "
+        "| coverage | notes |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in summary:
         coverage = f"{row['coverage']:.2f}" if row["coverage"] != "" else ""
@@ -334,8 +360,53 @@ def results_readme(
             f"| {row['method']} | {row['n']} | {row['accuracy']:.3f} "
             f"[{row['ci_low']:.3f}, {row['ci_high']:.3f}] | {row['mean_usd_per_question']:.4f} "
             f"| {row['mean_calls_per_question']:.1f} | {row['mean_latency_ms']:.0f} "
-            f"| {row['unparseable']} | {coverage} | {row['notes']} |"
+            f"| {row['unparseable']} | {row['refused']} | {coverage} | {row['notes']} |"
         )
+    lines += [
+        "",
+        "A method with no answer counts as wrong. *refused*: it had no answer because the "
+        "provider refused a call it needed (an HTTP 403 saying the content was flagged); "
+        "*unparseable*: it had no answer for any other reason, usually no final answer line.",
+    ]
+    refusals = config["refusals"]
+    lines += ["", "## Provider refusals", ""]
+    if refusals["calls"]:
+        lines += [
+            "Distinct calls refused by the provider, for the questions in this run. Refusals are "
+            "cached at cost 0 and replayed on reruns"
+            + (" (this run sent cached refusals again: --retry-refusals)."
+               if refusals["retry_refusals"] else " (--retry-refusals sends them again)."),
+            "",
+            "| model | stage | calibration | test |",
+            "|---|---|---|---|",
+        ]
+        lines += [
+            f"| {r['model']} | {r['stage']} | {r['calibration']} | {r['test']} |"
+            for r in refusals["by_model_stage"]
+        ]
+    else:
+        lines.append("None.")
+    dropped = config["dropped_critiques"]
+    lines += [
+        "",
+        f"## Dropped critiques ({dropped['split']} split)",
+        "",
+        "Critiques left out of scoring, by cause. art_r1 counts the peer critiques its "
+        "tournament dropped; judge counts the judge model's failed critiques.",
+        "",
+    ]
+    if dropped["rows"]:
+        lines += [
+            "| method | critic | refused | unparseable | other | total |",
+            "|---|---|---|---|---|---|",
+        ]
+        lines += [
+            f"| {r['method']} | {r['critic']} | {r['refused']} | {r['unparseable']} "
+            f"| {r['other']} | {r['total']} |"
+            for r in dropped["rows"]
+        ]
+    else:
+        lines.append("None.")
     if config["taus"]:
         lines += ["", "## Cascade thresholds (fitted on the calibration split)", ""]
         for name, tau in config["taus"].items():
@@ -387,7 +458,8 @@ async def run(args: argparse.Namespace) -> int:
             return 2
         transport = HttpTransport(api_key)
     try:
-        gateway = Gateway(transport, cache, budget, models, concurrency=args.concurrency)
+        gateway = Gateway(transport, cache, budget, models, concurrency=args.concurrency,
+                          retry_refusals=args.retry_refusals)
         jev = JevClient(gateway, models.jev.model, models.jev.fallback_model)
         runner = QuestionRunner(gateway, models, jev, seed=args.seed, skip=skip)
 
@@ -441,6 +513,7 @@ async def run(args: argparse.Namespace) -> int:
         sweeps = analysis.sweeps()
         calibration = analysis.gate_calibration()
         used_cost = sum(analysis.unique_cost(r) for r in raw)
+        refusals = refusal_rows(gateway, done, models)
         try:
             estimate: Estimate | None = await estimate_from_cache(
                 all_questions, planned, models, cache, args.seed, skip
@@ -521,6 +594,16 @@ async def run(args: argparse.Namespace) -> int:
                 "total_recorded_in_cache_usd": cache.total_cost(),
             },
             "projection": projection_config(estimate),
+            "refusals": {
+                "classifier": "HTTP 403 whose body says the content was flagged",
+                "retry_refusals": args.retry_refusals,
+                "calls": sum(r["calibration"] + r["test"] for r in refusals),
+                "by_model_stage": refusals,
+            },
+            "dropped_critiques": {
+                "split": analysis.eval_split,
+                "rows": analysis.dropped_critiques(),
+            },
         }
 
         (out_dir / "config.json").write_text(json.dumps(config, indent=2, default=_json_default))
@@ -548,11 +631,12 @@ async def run(args: argparse.Namespace) -> int:
         (out_dir / "README.md").write_text(results_readme(run_name, config, summary, calibration))
 
         print()
-        print(f"{'method':<28}{'n':>4}{'acc':>7}{'USD/q':>10}{'calls/q':>9}{'unparse':>9}")
+        print(f"{'method':<28}{'n':>4}{'acc':>7}{'USD/q':>10}{'calls/q':>9}{'unparse':>9}"
+              f"{'refused':>9}")
         for row in summary:
             print(f"{row['method']:<28}{row['n']:>4}{row['accuracy']:>7.3f}"
                   f"{row['mean_usd_per_question']:>10.4f}{row['mean_calls_per_question']:>9.1f}"
-                  f"{row['unparseable']:>9}")
+                  f"{row['unparseable']:>9}{row['refused']:>9}")
         print()
         print("Taus (calibration): " + ", ".join(f"{k}={v:.3f}" for k, v in analysis.taus.items()))
         print(f"Live spend this run: ${gateway.live_spend:.4f} ({gateway.live_calls} calls)")

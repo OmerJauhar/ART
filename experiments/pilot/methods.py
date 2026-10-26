@@ -23,7 +23,15 @@ from art_framework.tournament.engine import RoundResult, TournamentConfig, Tourn
 from experiments.pilot.agents import PilotAgent
 from experiments.pilot.analysis import check_skip
 from experiments.pilot.data import Question
-from experiments.pilot.gateway import QUESTION_ID, STAGE, TRACE, CallRecord, Gateway
+from experiments.pilot.gateway import (
+    QUESTION_ID,
+    STAGE,
+    TRACE,
+    CallRecord,
+    Gateway,
+    failure_cause,
+    failure_text,
+)
 from experiments.pilot.jev import JevClient
 from experiments.pilot.prompts import (
     FUSION_SYSTEM,
@@ -73,17 +81,18 @@ async def traced(factory: Callable[[], Awaitable[T]]) -> tuple[T | None, list[Ca
         try:
             return await factory(), trace, ""
         except Exception as e:  # recorded per method; budget stops are checked by the caller
-            return None, trace, f"{type(e).__name__}: {e}"
+            return None, trace, failure_text(e)
 
     return await asyncio.create_task(runner())
 
 
 @dataclass
 class EloSnapshot:
-    """ELO ratings by model before and after one round."""
+    """ELO ratings by model before and after one round, and the critiques it dropped."""
 
     before: dict[str, float]
     after: dict[str, float]
+    dropped: list[dict[str, str]]
 
 
 class QuestionRunner:
@@ -135,11 +144,27 @@ class QuestionRunner:
         model_of = {agent.id: model_id for model_id, agent in agents.items()}
         snapshots: list[EloSnapshot] = []
         before = {model_of[a.id]: a.elo_score for a in agents.values()}
+        for agent in agents.values():
+            agent.failed_critiques.clear()
 
         def on_round(_: RoundResult) -> None:
             nonlocal before
             after = {model_of[a.id]: a.elo_score for a in agents.values()}
-            snapshots.append(EloSnapshot(before=before, after=after))
+            dropped = sorted(
+                (
+                    {
+                        "critic": model_of[a.id],
+                        "target": model_of[f["target"]],
+                        "cause": failure_cause(f["error"]),
+                        "error": f["error"],
+                    }
+                    for a in agents.values() for f in a.failed_critiques
+                ),
+                key=lambda d: (d["critic"], d["target"]),
+            )
+            for agent in agents.values():
+                agent.failed_critiques.clear()
+            snapshots.append(EloSnapshot(before=before, after=after, dropped=dropped))
             before = after
 
         engine = TournamentEngine(
@@ -206,6 +231,7 @@ class QuestionRunner:
             entry = record["answers"][spec.id]
             methods[f"single:{spec.label}"] = {
                 "answer": entry["letter"],
+                "error": entry["error"],
                 "groups": [[answer_keys[spec.id]]] if answer_keys[spec.id] else [],
             }
 
@@ -480,5 +506,6 @@ def serialize_round(
         "elo_before": elo.before,
         "elo_after": elo.after,
         "failed_critiques": round_result.failed_critiques,
+        "dropped_critiques": elo.dropped,
         "best_model": model_of[round_result.best_response_agent_id],
     }

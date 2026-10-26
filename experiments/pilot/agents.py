@@ -12,7 +12,7 @@ from typing import Any
 
 from art_framework.agents.base import AgentConfig, AgentResponse, Critique
 from art_framework.agents.llm_agent import LLMAgent
-from experiments.pilot.gateway import STAGE, Gateway
+from experiments.pilot.gateway import STAGE, Gateway, failure_text
 from experiments.pilot.settings import ModelSpec, PilotModels
 
 
@@ -36,6 +36,9 @@ class PilotAgent(LLMAgent):
         # A stable ID (instead of a random UUID) keeps the engine's agent ordering, and so
         # every prompt, identical across runs; that is what lets reruns hit the cache
         self.state.agent_id = spec.id
+        # Critiques by this agent that failed, as {"target": agent ID, "error": failure_text};
+        # the tournament engine only counts them
+        self.failed_critiques: list[dict[str, str]] = []
 
     async def initialize(self) -> None:
         """Nothing to set up: the Gateway owns the HTTP client."""
@@ -93,10 +96,15 @@ class PilotAgent(LLMAgent):
         target_response: AgentResponse,
         context: dict[str, Any] | None = None,
     ) -> Critique:
-        """Critique an answer, tagging the call as a critique."""
+        """Critique an answer, tagging the call as a critique; record why it failed, if it did."""
         token = STAGE.set("critique")
         try:
             return await super().critique_response(original_query, target_response, context)
+        except Exception as e:
+            self.failed_critiques.append(
+                {"target": target_response.agent_id, "error": failure_text(e)}
+            )
+            raise
         finally:
             STAGE.reset(token)
 

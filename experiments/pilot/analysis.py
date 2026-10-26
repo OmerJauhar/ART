@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from experiments.pilot.gateway import CallRecord
+from experiments.pilot.gateway import CallRecord, failure_cause
 from experiments.pilot.settings import PilotModels
 
 # A threshold above every possible p: the cascade always escalates
@@ -25,6 +25,8 @@ CASCADES = ("cascade_llm", "cascade_jev")
 
 # The cascades escalate to art_r1 and the ELO router is fitted from art_r1's tournaments
 NEEDS_ART_R1 = ("cascade_llm", "cascade_jev", "elo_router")
+
+FAILURE_CAUSES = ("refused", "unparseable", "other")
 
 
 def all_methods(models: PilotModels) -> list[str]:
@@ -288,13 +290,21 @@ class Analysis:
         record: dict[str, Any],
         answer: str | None,
         groups: list[list[str]],
+        error: str | None = None,
     ) -> dict[str, Any]:
-        """Answer, correctness and usage for one method on one question."""
+        """
+        Answer, correctness and usage for one method on one question.
+
+        A missing answer is "refused" when the method failed on a provider refusal and
+        "unparseable" otherwise; either way it counts as wrong.
+        """
         usage = method_usage(groups, self.records)
+        refused = answer is None and failure_cause(error) == "refused"
         return {
             "answer": answer,
             "correct": answer is not None and answer == record["correct_letter"],
-            "unparseable": answer is None,
+            "unparseable": answer is None and not refused,
+            "refused": refused,
             "cost_usd": usage.cost_usd,
             "calls": usage.calls,
             "tokens": usage.tokens,
@@ -311,7 +321,8 @@ class Analysis:
         ]:
             if name in methods:
                 outcomes[name] = self._outcome(
-                    record, methods[name]["answer"], methods[name]["groups"]
+                    record, methods[name]["answer"], methods[name]["groups"],
+                    methods[name].get("error"),
                 )
 
         if "majority_vote" not in self.skip:
@@ -358,11 +369,13 @@ class Analysis:
         groups = list(cascade["accept_groups"])
         if accepted:
             answer = cascade["cheap_answer"]
+            error = record["answers"][self.models.roles["cheap"]].get("error")
         else:
             answer = record["methods"]["art_r1"]["answer"]
+            error = record["methods"]["art_r1"].get("error")
             groups += record["methods"]["art_r1"]["groups"]
         return {
-            **self._outcome(record, answer, groups),
+            **self._outcome(record, answer, groups, error),
             "p": cascade["p"],
             "tau": tau,
             "accepted": accepted,
@@ -408,6 +421,7 @@ class Analysis:
                 "mean_tokens_per_question": float(np.mean([o["tokens"] for o in outs])),
                 "mean_latency_ms": float(np.mean([o["latency_ms"] for o in outs])),
                 "unparseable": sum(o["unparseable"] for o in outs),
+                "refused": sum(o["refused"] for o in outs),
                 "coverage": "",
                 "tau": "",
                 "notes": "",
@@ -430,6 +444,38 @@ class Analysis:
             elif name == "best_single_oracle" and self.best_single_oracle:
                 oracle = self.labels[self.best_single_oracle]
                 row["notes"] = f"ORACLE: {oracle} picked on this split"
+            rows.append(row)
+        return rows
+
+    def dropped_critiques(self) -> list[dict[str, Any]]:
+        """
+        Critiques dropped on the evaluation split, counted by method, critic and cause.
+
+        art_r1 and art_r2 count the peer critiques their tournaments dropped (every round);
+        judge counts the judge model's critiques that failed.
+        """
+        counts: dict[tuple[str, str], Counter[str]] = {}
+        for record in self.eval_records:
+            methods = record["methods"]
+            for name in ("art_r1", "art_r2"):
+                for round_record in methods.get(name, {}).get("rounds", []):
+                    for drop in round_record.get("dropped_critiques", []):
+                        counts.setdefault((name, drop["critic"]), Counter())[drop["cause"]] += 1
+            judge = methods.get("judge")
+            if judge:
+                critic = self.models.roles["judge"]
+                for target in judge["per_target"].values():
+                    if target["overall"] is None:
+                        cause = failure_cause(target["error"])
+                        counts.setdefault(("judge", critic), Counter())[cause] += 1
+        order = {m: i for i, m in enumerate(["art_r1", "art_r2", "judge"])}
+        rows = []
+        for (method, critic), by_cause in sorted(
+            counts.items(), key=lambda kv: (order[kv[0][0]], self.models.ids.index(kv[0][1]))
+        ):
+            row: dict[str, Any] = {"method": method, "critic": self.labels[critic]}
+            row.update({cause: by_cause[cause] for cause in FAILURE_CAUSES})
+            row["total"] = sum(by_cause.values())
             rows.append(row)
         return rows
 

@@ -5,6 +5,9 @@ Pilot Gateway
 Every model call (chat completions and Jev decisions) goes through one Gateway, which adds
 the persistent cache, the budget guard, a concurrency limit, retries with exponential backoff,
 and a per-call record used for cost attribution.
+
+A provider refusal (see is_provider_refusal) is a deterministic outcome: it is cached at cost 0
+and replayed as a ProviderRefusal, unless the gateway is told to retry refusals.
 """
 
 from __future__ import annotations
@@ -26,6 +29,12 @@ from experiments.pilot.settings import PilotModels
 # Conservative characters-per-token used only to size budget reservations
 _RESERVE_CHARS_PER_TOKEN = 2.0
 
+# Key of the cached response body that stands for a provider refusal
+REFUSAL_KEY = "pilot_refusal"
+
+# Start of LLMAgent's error for a critique without every score (see _parse_critique_scores)
+UNPARSEABLE_CRITIQUE = "Critique missing scores"
+
 
 class ApiError(RuntimeError):
     """A non-retryable API error, or retries exhausted."""
@@ -34,6 +43,43 @@ class ApiError(RuntimeError):
         """Store the status alongside the message."""
         super().__init__(f"API error {status}: {message}")
         self.status = status
+        self.message = message
+
+
+class ProviderRefusal(ApiError):
+    """The provider declined the request on content grounds (see is_provider_refusal)."""
+
+
+def is_provider_refusal(status: int | str | None, message: str) -> bool:
+    """
+    Whether an API error is a provider refusal.
+
+    Only the one case seen in the pilot counts: an HTTP 403 whose body says the content was
+    flagged (OpenAI's "This content was flagged for possible biological risk...", passed
+    through by OpenRouter). Other providers' wording is not guessed at.
+    """
+    return str(status) == "403" and "flagged" in message.lower()
+
+
+def failure_text(error: BaseException) -> str:
+    """How a failed call or method is recorded: exception type, then message."""
+    return f"{type(error).__name__}: {error}"
+
+
+def failure_cause(text: str | None) -> str:
+    """
+    Classify a failure recorded with failure_text.
+
+    Returns:
+        "refused" (provider refusal), "unparseable" (a critique without every score) or
+        "other"
+    """
+    text = text or ""
+    if text.startswith(f"{ProviderRefusal.__name__}:"):
+        return "refused"
+    if text.startswith(f"ValueError: {UNPARSEABLE_CRITIQUE}"):
+        return "unparseable"
+    return "other"
 
 
 class Transport(Protocol):
@@ -185,8 +231,14 @@ class Gateway:
         budget: BudgetGuard,
         models: PilotModels,
         concurrency: int = 8,
+        retry_refusals: bool = False,
     ) -> None:
-        """Create the gateway."""
+        """
+        Create the gateway.
+
+        With retry_refusals, each cached refusal is sent again once in this gateway's life
+        and the new outcome replaces it in the cache.
+        """
         self.transport = transport
         self.cache = cache
         self.budget = budget
@@ -198,6 +250,10 @@ class Gateway:
         self.live_spend = 0.0
         # Questions with at least one call refused by the budget guard (incomplete)
         self.refused_questions: set[str] = set()
+        self.retry_refusals = retry_refusals
+        self._retried: set[str] = set()
+        # Provider refusals met by this gateway (live or cached), keyed by call
+        self.refusals: dict[str, dict[str, Any]] = {}
 
     def chat_url(self) -> str:
         """Chat completions URL."""
@@ -234,6 +290,8 @@ class Gateway:
         model = str(body.get("model", ""))
 
         cached = self.cache.get(key)
+        if cached is not None and self._retry(key, cached):
+            cached = None
         served_from_cache = cached is not None
         if cached is None:
             try:
@@ -242,6 +300,16 @@ class Gateway:
                 if QUESTION_ID.get():
                     self.refused_questions.add(QUESTION_ID.get())
                 raise
+
+        refusal = cached.response.get(REFUSAL_KEY)
+        if refusal is not None:
+            # Not a CallRecord: like any failed call, it is in no trace and costs nothing
+            entry = self.refusals.setdefault(key, {
+                "model": model, "stage": STAGE.get(), "question_ids": set(),
+            })
+            if QUESTION_ID.get():
+                entry["question_ids"].add(QUESTION_ID.get())
+            raise ProviderRefusal(refusal.get("status"), str(refusal.get("message", "")))
 
         prompt, completion, _ = _usage_numbers(endpoint, cached.response)
         record = self.records.get(key)
@@ -268,6 +336,16 @@ class Gateway:
         if trace is not None:
             trace.append(record)
         return record
+
+    def _retry(self, key: str, cached: CachedCall) -> bool:
+        """Whether to send a cached refusal again instead of replaying it."""
+        if not self.retry_refusals or REFUSAL_KEY not in cached.response:
+            return False
+        if key in self._retried and key not in self._inflight:
+            # Already retried in this run; the cache holds the new outcome
+            return False
+        self._retried.add(key)
+        return True
 
     async def _fetch(
         self,
@@ -312,6 +390,7 @@ class Gateway:
         """Make a billed call under the budget guard and store it."""
         worst_case = self._worst_case(endpoint, model, body)
         await self.budget.reserve(worst_case)
+        start = time.perf_counter()
         try:
             async with self._semaphore:
                 start = time.perf_counter()
@@ -323,7 +402,16 @@ class Gateway:
                 # Out of OpenRouter credits: stop the run as if the budget guard had
                 self.budget.exhausted = True
                 raise BudgetExceeded(f"OpenRouter reports insufficient credits: {e}") from e
-            raise
+            if not is_provider_refusal(e.status, e.message):
+                raise
+            # A refusal is not billed; store it so reruns replay it instead of asking again
+            self.live_calls += 1
+            refusal = {REFUSAL_KEY: {"status": e.status, "message": e.message}}
+            latency_ms = (time.perf_counter() - start) * 1000
+            self.cache.put(key, endpoint, model, body, refusal, latency_ms, 0.0)
+            stored = self.cache.get(key)
+            assert stored is not None
+            return stored
         except BaseException:
             await self.budget.release(worst_case)
             raise
