@@ -273,6 +273,19 @@ basis.
 | `accuracy_vs_cost.png` / `.svg` | accuracy (with CI) vs mean USD/question on a log axis, plus the cascade sweeps |
 | `README.md`, `run.log` | short results summary with total spend, provider refusals and dropped critiques; full log |
 
+## Publishing (`published/<run_name>/`, tracked)
+
+`python -m experiments.pilot.publish --run-name pilot-v1` copies the shareable part of a run to
+`published/pilot-v1/`: the results README (plus a data and attribution section with the
+LAB-Bench canary, read from the dataset files), `summary.csv`, the plots, `tau_sweep.csv`, the
+gate calibration tables, `config.json` without local paths, `per_question.csv` (LAB-Bench ID,
+subset, split, then correct/cost/calls per method and the ELO router's choice) and
+`elo_router.json` (ratings, top model, trajectory). Question text, options, correct letters and
+model outputs are never published: `questions.jsonl`, `calls.jsonl`, `per_question.jsonl` and
+`run.log` stay in `results/`, and publish fails if any published file contains a question's
+text, an option, a model output or the API key. `--print-table` prints the published summary as
+a Markdown table.
+
 ## Tests
 
 ```bash

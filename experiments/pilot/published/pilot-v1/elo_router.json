@@ -1,0 +1,206 @@
+{
+  "ratings": {
+    "ProtocolQA": {
+      "deepseek/deepseek-v4-pro": 1490.1876895543764,
+      "google/gemini-3.8-flash": 1494.5708841542196,
+      "anthropic/claude-sonnet-5.5": 1513.470142442254,
+      "openai/gpt-6.1-sol": 1501.77128384915
+    },
+    "SeqQA": {
+      "deepseek/deepseek-v4-pro": 1478.468126181874,
+      "google/gemini-3.8-flash": 1503.2467005826943,
+      "anthropic/claude-sonnet-5.5": 1506.4417952124654,
+      "openai/gpt-6.1-sol": 1511.8433780229664
+    }
+  },
+  "top_model": {
+    "ProtocolQA": "anthropic/claude-sonnet-5.5",
+    "SeqQA": "openai/gpt-6.1-sol"
+  },
+  "trajectory": {
+    "ProtocolQA": [
+      {
+        "question_id": "bb98fa12-c13b-4058-876b-7eee6f85d4d0",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1500.0,
+          "google/gemini-3.8-flash": 1499.5066666666667,
+          "anthropic/claude-sonnet-5.5": 1500.4933333333333,
+          "openai/gpt-6.1-sol": 1500.0
+        }
+      },
+      {
+        "question_id": "fca46ec7-f3b9-488d-82c6-4a9bc2fd9bc4",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1496.0862222222222,
+          "google/gemini-3.8-flash": 1499.6854028463285,
+          "anthropic/claude-sonnet-5.5": 1503.7065971536715,
+          "openai/gpt-6.1-sol": 1500.5217777777777
+        }
+      },
+      {
+        "question_id": "b39e9e55-33c6-4e9a-8ef8-33c973dc6bc7",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1489.9069570737395,
+          "google/gemini-3.8-flash": 1501.7767190207937,
+          "anthropic/claude-sonnet-5.5": 1506.0941376683961,
+          "openai/gpt-6.1-sol": 1502.2221862370707
+        }
+      },
+      {
+        "question_id": "a516333c-21b1-47cf-851f-4c1f34f83aaf",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1486.1272520754114,
+          "google/gemini-3.8-flash": 1502.666802993706,
+          "anthropic/claude-sonnet-5.5": 1508.1761292938477,
+          "openai/gpt-6.1-sol": 1503.029815637035
+        }
+      },
+      {
+        "question_id": "82e210e8-ac32-41fa-a9fa-0bc563903a86",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1487.1675538468423,
+          "google/gemini-3.8-flash": 1502.2339064316463,
+          "anthropic/claude-sonnet-5.5": 1510.5358962442397,
+          "openai/gpt-6.1-sol": 1500.0626434772716
+        }
+      },
+      {
+        "question_id": "ec8dfbd9-fbee-4ea8-aa0c-d14112eb36d5",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1487.9547195061527,
+          "google/gemini-3.8-flash": 1502.0968605534333,
+          "anthropic/claude-sonnet-5.5": 1510.3038034075291,
+          "openai/gpt-6.1-sol": 1499.6446165328848
+        }
+      },
+      {
+        "question_id": "c8341c3c-9e94-4567-9a26-186ad6fe1384",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1488.4861115993226,
+          "google/gemini-3.8-flash": 1500.386427793789,
+          "anthropic/claude-sonnet-5.5": 1511.4552292026303,
+          "openai/gpt-6.1-sol": 1499.6722314042581
+        }
+      },
+      {
+        "question_id": "16fc3385-4cbd-455b-ba84-1648ee011204",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1488.0368914282144,
+          "google/gemini-3.8-flash": 1495.057825319651,
+          "anthropic/claude-sonnet-5.5": 1514.097380578475,
+          "openai/gpt-6.1-sol": 1502.8079026736596
+        }
+      },
+      {
+        "question_id": "87c6a82d-6c84-4bb7-a7bc-ee56949f5853",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1489.5465537015118,
+          "google/gemini-3.8-flash": 1494.2160998946765,
+          "anthropic/claude-sonnet-5.5": 1514.350204496692,
+          "openai/gpt-6.1-sol": 1501.8871419071197
+        }
+      },
+      {
+        "question_id": "aed5fff6-10fa-4e2d-b444-edcaec74a644",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1490.1876895543764,
+          "google/gemini-3.8-flash": 1494.5708841542196,
+          "anthropic/claude-sonnet-5.5": 1513.470142442254,
+          "openai/gpt-6.1-sol": 1501.77128384915
+        }
+      }
+    ],
+    "SeqQA": [
+      {
+        "question_id": "148c4436-230e-488b-be1c-90a4cc1d3c80",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1499.5262222222223,
+          "google/gemini-3.8-flash": 1499.56,
+          "anthropic/claude-sonnet-5.5": 1500.9137777777778,
+          "openai/gpt-6.1-sol": 1500.0
+        }
+      },
+      {
+        "question_id": "c61082a2-2c8c-4244-b09e-5e0a0dc314f9",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1492.246868690654,
+          "google/gemini-3.8-flash": 1499.1407946674226,
+          "anthropic/claude-sonnet-5.5": 1505.4318922217026,
+          "openai/gpt-6.1-sol": 1503.1804444202207
+        }
+      },
+      {
+        "question_id": "4d9b8f19-4fb3-42e5-ace4-bf8d01ace2d0",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1490.2338732825374,
+          "google/gemini-3.8-flash": 1496.7402190302025,
+          "anthropic/claude-sonnet-5.5": 1507.3295809676813,
+          "openai/gpt-6.1-sol": 1505.6963267195788
+        }
+      },
+      {
+        "question_id": "e8e578de-6d94-4a1a-9829-9a7330c09f16",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1484.3816002210042,
+          "google/gemini-3.8-flash": 1498.6460856707833,
+          "anthropic/claude-sonnet-5.5": 1509.8469012659002,
+          "openai/gpt-6.1-sol": 1507.1254128423122
+        }
+      },
+      {
+        "question_id": "3a2baa0e-ecf2-4a09-a456-9814c3e24061",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1485.5481749900325,
+          "google/gemini-3.8-flash": 1496.849256654755,
+          "anthropic/claude-sonnet-5.5": 1509.2919269732047,
+          "openai/gpt-6.1-sol": 1508.3106413820078
+        }
+      },
+      {
+        "question_id": "c79459b2-36cb-40af-bb1d-fdc9e6d8f3aa",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1486.434423247786,
+          "google/gemini-3.8-flash": 1497.0426351914398,
+          "anthropic/claude-sonnet-5.5": 1508.7220295871987,
+          "openai/gpt-6.1-sol": 1507.8009119735755
+        }
+      },
+      {
+        "question_id": "3f9f15f0-a36b-4bf2-bf07-7c0b8b83c287",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1478.3286707024918,
+          "google/gemini-3.8-flash": 1501.1583766445103,
+          "anthropic/claude-sonnet-5.5": 1509.4607910149616,
+          "openai/gpt-6.1-sol": 1511.0521616380363
+        }
+      },
+      {
+        "question_id": "e20876e2-6ba3-4ebf-91e4-44796284bca2",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1479.6560809395592,
+          "google/gemini-3.8-flash": 1501.087687905142,
+          "anthropic/claude-sonnet-5.5": 1508.8811759964178,
+          "openai/gpt-6.1-sol": 1510.375055158881
+        }
+      },
+      {
+        "question_id": "944d8892-ff7a-402e-b6b1-2768872361e1",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1477.6741025966162,
+          "google/gemini-3.8-flash": 1502.0994862502932,
+          "anthropic/claude-sonnet-5.5": 1509.461371105481,
+          "openai/gpt-6.1-sol": 1510.7650400476095
+        }
+      },
+      {
+        "question_id": "ff28fc5e-3678-40f2-810d-c57d03fa49ce",
+        "elo": {
+          "deepseek/deepseek-v4-pro": 1478.468126181874,
+          "google/gemini-3.8-flash": 1503.2467005826943,
+          "anthropic/claude-sonnet-5.5": 1506.4417952124654,
+          "openai/gpt-6.1-sol": 1511.8433780229664
+        }
+      }
+    ]
+  }
+}
