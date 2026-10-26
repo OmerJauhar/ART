@@ -258,3 +258,42 @@ class TestRefusalsInResults:
         # A refused answer still counts as wrong, and a replay changes nothing
         assert outputs[0] == outputs[1]
         assert outputs[0][f"single:{gpt_label}"]["accuracy"] <= str(2 / 4)
+
+
+class TestBackfillLog:
+    """Test cases for attributing run.log failure lines to tournaments (backfill_refusals)."""
+
+    def test_log_failures(self, tmp_path: Path) -> None:
+        """Test tournament attribution, refusal detection and the per-question cutoff."""
+        from experiments.pilot.backfill_refusals import log_failures, read_log
+
+        stamp = "2026-10-25 04:42:15.097 | {:<8} | art_framework.tournament.engine:f:1 - {}"
+        refused = f"API error 403: {FLAGGED}"
+        lines = [
+            stamp.format("INFO", "Starting tournament A for query: Protocol:"),
+            "Shared prefix...",
+            stamp.format("INFO", "Starting tournament B for query: Other question..."),
+            stamp.format("ERROR", f"Agent m1 failed to generate response: {refused}"),
+            stamp.format("WARNING", f"Critique from m1 to m2 failed: {refused}"),
+            stamp.format("WARNING", "Critique from m3 to m2 failed: Critique missing scores"),
+            stamp.format("WARNING", "Round 1: 2 of 12 critiques failed and were dropped"),
+            stamp.format("INFO", "Tournament B completed. Winner: m2"),
+            stamp.format("INFO", "Tournament A completed. Winner: m2"),
+            # The ELO router fit replays tournament A's question afterwards
+            stamp.format("INFO", "Starting tournament C for query: Protocol:"),
+            "Shared prefix...",
+            stamp.format("WARNING", "Critique from m1 to m2 failed: client has been closed."),
+            stamp.format("INFO", "Tournament C completed. Winner: m2"),
+        ]
+        path = tmp_path / "run.log"
+        path.write_text("\n".join(lines) + "\n")
+
+        failures, prefixes = log_failures(read_log(path), n_tournaments=2)
+
+        assert prefixes == {"A": "Protocol:\nShared prefix", "B": "Other question"}
+        answer, critique, unparseable = failures
+        assert (answer.stage, answer.model, answer.tournaments) == ("answer", "m1", {"A", "B"})
+        assert (critique.model, critique.target, critique.tournaments) == ("m1", "m2", {"B"})
+        assert answer.refused and critique.refused and not unparseable.refused
+        assert critique.message == FLAGGED
+        assert answer.record.line == 4

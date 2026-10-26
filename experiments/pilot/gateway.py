@@ -39,11 +39,25 @@ UNPARSEABLE_CRITIQUE = "Critique missing scores"
 class ApiError(RuntimeError):
     """A non-retryable API error, or retries exhausted."""
 
-    def __init__(self, status: int | str | None, message: str) -> None:
-        """Store the status alongside the message."""
+    def __init__(
+        self,
+        status: int | str | None,
+        message: str,
+        note: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Store the status alongside the message.
+
+        Args:
+            status: HTTP status or API error code
+            message: Error message
+            note: Extra fields stored with the cached refusal, if this is one (for example
+                where a refusal was backfilled from)
+        """
         super().__init__(f"API error {status}: {message}")
         self.status = status
         self.message = message
+        self.note = note or {}
 
 
 class ProviderRefusal(ApiError):
@@ -406,7 +420,7 @@ class Gateway:
                 raise
             # A refusal is not billed; store it so reruns replay it instead of asking again
             self.live_calls += 1
-            refusal = {REFUSAL_KEY: {"status": e.status, "message": e.message}}
+            refusal = {REFUSAL_KEY: {"status": e.status, "message": e.message, **e.note}}
             latency_ms = (time.perf_counter() - start) * 1000
             self.cache.put(key, endpoint, model, body, refusal, latency_ms, 0.0)
             stored = self.cache.get(key)

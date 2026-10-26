@@ -164,6 +164,9 @@ deliberately narrow: an HTTP 403 whose body says the content was flagged. Nothin
 - A refusal is cached as a deterministic outcome at cost 0, so a rerun replays it instead of
   asking again. `--retry-refusals` sends each cached refusal once more and caches the new
   outcome.
+- The 5 refusals from the original pilot-v1 run predate refusal caching and were backfilled
+  from its `run.log` (`python -m experiments.pilot.backfill_refusals --run-name pilot-v1`), so
+  the rerun reproduces the original run with no new API calls.
 - `summary.csv` and the results README have a `refused` column next to `unparseable`. A
   refused answer counts as wrong, exactly like an unparseable one.
 - The results README lists the refused calls by model and stage, and a "Dropped critiques"

@@ -461,14 +461,19 @@ async def replay(
     cache: CallCache,
     seed: int,
     skip: set[str],
+    transport: CacheOnlyTransport | None = None,
 ) -> tuple[dict[str, CallRecord], defaultdict[str, Missing]]:
     """
     Run questions through the pipeline using only the cache.
 
+    Args:
+        transport: Receives every cache miss; CacheOnlyTransport (refuse and record) or a
+            subclass of it
+
     Returns:
         (call records of the cache hits, distinct missing calls per question ID)
     """
-    transport = CacheOnlyTransport()
+    transport = transport or CacheOnlyTransport()
     gateway = Gateway(transport, cache, BudgetGuard(math.inf), models, concurrency=16)
     jev = JevClient(gateway, models.jev.model, models.jev.fallback_model)
     runner = QuestionRunner(gateway, models, jev, seed=seed, skip=skip)
