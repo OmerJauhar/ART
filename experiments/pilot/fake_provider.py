@@ -60,6 +60,7 @@ class FakeTransport:
         skills = [0.45, 0.55, 0.62, 0.70]
         self.skill = {m.id: skills[i] for i, m in enumerate(ranked)}
         self.calls = 0
+        self.closed = False
 
     def _find(self, text: str) -> Question | None:
         """The question whose formatted text appears in text."""
@@ -75,10 +76,17 @@ class FakeTransport:
 
     async def post(self, url: str, body: dict[str, Any]) -> dict[str, Any]:
         """Dispatch on the endpoint."""
+        if self.closed:
+            # Same failure as the real client
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
         self.calls += 1
         if url.rstrip("/").endswith("/decisions"):
             return self._decision(body)
         return self._chat(body)
+
+    async def close(self) -> None:
+        """Refuse every later request, like the real HTTP client."""
+        self.closed = True
 
     def _chat(self, body: dict[str, Any]) -> dict[str, Any]:
         """Fake chat completion."""

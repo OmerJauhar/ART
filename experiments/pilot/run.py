@@ -386,189 +386,190 @@ async def run(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return 2
         transport = HttpTransport(api_key)
-    gateway = Gateway(transport, cache, budget, models, concurrency=args.concurrency)
-    jev = JevClient(gateway, models.jev.model, models.jev.fallback_model)
-    runner = QuestionRunner(gateway, models, jev, seed=args.seed, skip=skip)
-
-    mode = "DRY RUN (fake provider)" if args.dry_run else "LIVE (OpenRouter)"
-    print(f"{mode}: {len(questions)} questions -> {out_dir}")
-    if skip:
-        print(f"Skipping methods: {', '.join(sorted(skip))}")
-    print(f"Budget ${args.max_usd:.2f}; already recorded in {cache_path.name}: "
-          f"${budget.spent:.4f}")
-
-    semaphore = asyncio.Semaphore(args.question_concurrency)
-    finished = 0
-
-    async def process(question: Question) -> dict[str, Any] | None:
-        nonlocal finished
-        async with semaphore:
-            if budget.exhausted:
-                return None
-            try:
-                record = await runner.run(question)
-            except BudgetExceeded:
-                return None
-            if question.id in gateway.refused_questions:
-                # The budget guard refused one of this question's calls: incomplete
-                return None
-            finished += 1
-            print(f"  [{finished}/{len(questions)}] {question.subset:<16} {question.split:<11} "
-                  f"live calls {gateway.live_calls:>5}  spend ${gateway.live_spend:.4f}")
-            return record
-
-    # Calibration questions first, so a run stopped by the budget guard still has the
-    # calibration split that the cascade thresholds and the ELO router are fitted on
-    results: list[dict[str, Any] | None] = []
     try:
+        gateway = Gateway(transport, cache, budget, models, concurrency=args.concurrency)
+        jev = JevClient(gateway, models.jev.model, models.jev.fallback_model)
+        runner = QuestionRunner(gateway, models, jev, seed=args.seed, skip=skip)
+
+        mode = "DRY RUN (fake provider)" if args.dry_run else "LIVE (OpenRouter)"
+        print(f"{mode}: {len(questions)} questions -> {out_dir}")
+        if skip:
+            print(f"Skipping methods: {', '.join(sorted(skip))}")
+        print(f"Budget ${args.max_usd:.2f}; already recorded in {cache_path.name}: "
+              f"${budget.spent:.4f}")
+
+        semaphore = asyncio.Semaphore(args.question_concurrency)
+        finished = 0
+
+        async def process(question: Question) -> dict[str, Any] | None:
+            nonlocal finished
+            async with semaphore:
+                if budget.exhausted:
+                    return None
+                try:
+                    record = await runner.run(question)
+                except BudgetExceeded:
+                    return None
+                if question.id in gateway.refused_questions:
+                    # The budget guard refused one of this question's calls: incomplete
+                    return None
+                finished += 1
+                print(f"  [{finished}/{len(questions)}] {question.subset:<16} {question.split:<11} "
+                      f"live calls {gateway.live_calls:>5}  spend ${gateway.live_spend:.4f}")
+                return record
+
+        # Calibration questions first, so a run stopped by the budget guard still has the
+        # calibration split that the cascade thresholds and the ELO router are fitted on
+        results: list[dict[str, Any] | None] = []
         for split in ("calibration", "test"):
             results += await asyncio.gather(*[process(q) for q in questions if q.split == split])
+        ordered = [q for split in ("calibration", "test") for q in questions if q.split == split]
+        raw = [r for r in results if r is not None]
+        done = [q for q, r in zip(ordered, results) if r is not None]
+        stopped = budget.exhausted and len(raw) < len(questions)
+        if stopped:
+            print(f"Budget guard stopped the run after {len(raw)} of {len(questions)} questions.")
+
+        calibration_done = [q for q in done if q.split == "calibration"]
+        elo_router = None
+        if calibration_done and "elo_router" not in skip:
+            # Replays cached art_r1 tournaments, so it runs even after the budget guard stopped
+            elo_router = await fit_elo_router(runner, calibration_done, models)
+
+        analysis = Analysis(raw, gateway.records, models, elo_router, seed=args.seed, skip=skip)
+        summary = analysis.summary()
+        sweeps = analysis.sweeps()
+        calibration = analysis.gate_calibration()
+        used_cost = sum(analysis.unique_cost(r) for r in raw)
+        try:
+            estimate: Estimate | None = await estimate_from_cache(
+                all_questions, planned, models, cache, args.seed, skip
+            )
+        except ValueError:
+            estimate = None
+
+        versions: dict[str, set[str]] = {}
+        for record in gateway.records.values():
+            versions.setdefault(record.model, set()).add(record.model_version)
+        jev_versions = sorted({
+            v for m, vs in versions.items() if m.startswith("typesafe/") for v in vs
+        })
+        config = {
+            "run_name": run_name,
+            "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "git_commit": git_commit(),
+            "command": " ".join(sys.argv),
+            "dry_run": args.dry_run,
+            "dataset": {
+                "name": pilot_data.DATASET,
+                "revision": pilot_data.REVISION,
+                "subsets_used": list(pilot_data.USED_SUBSETS),
+                "subsets_excluded": pilot_data.EXCLUDED_SUBSETS,
+                "seqqa_subtasks_excluded": list(pilot_data.EXCLUDED_SEQQA_SUBTASKS),
+                "usable_text_only": usable,
+                "sample_size": pilot_data.SAMPLE_SIZE,
+                "split_counts": split_counts(all_questions),
+            },
+            "seed": args.seed,
+            "split": {"calibration": "first 30 sampled", "test": "last 70 sampled"},
+            "selection": {
+                "subsets": args.subsets,
+                "test_per_subset": args.test_per_subset,
+                "skip_methods": sorted(skip),
+                "smoke": args.smoke,
+                "limit": args.limit,
+                "selected_split_counts": split_counts(planned),
+                "run_split_counts": split_counts(questions),
+                "note": "selection keeps the sample's order, indices and splits (no resampling)",
+            },
+            "evaluation_split": analysis.eval_split,
+            "models": [
+                {
+                    "id": m.id, "label": m.label, "family": m.family,
+                    "prompt_usd_per_mtok": m.prompt_usd_per_mtok,
+                    "completion_usd_per_mtok": m.completion_usd_per_mtok,
+                    "supports_temperature": m.supports_temperature,
+                    "reasoning": m.reasoning,
+                    "versions_returned": sorted(versions.get(m.id, set())),
+                }
+                for m in models.models
+            ],
+            "prices_fetched": models.fetched,
+            "roles": models.roles,
+            "temperature": models.temperature,
+            "max_tokens": models.max_tokens,
+            "jev": {
+                "requested_model": models.jev.model,
+                "fallback_model": models.jev.fallback_model,
+                "model_used": jev.model,
+                "versions_returned": jev_versions,
+                "input_usd_per_mtok": models.jev.input_usd_per_mtok,
+            },
+            "taus": analysis.taus,
+            "elo_router": elo_router,
+            "best_single_calibration": analysis.best_single_calibration,
+            "best_single_oracle": analysis.best_single_oracle,
+            "budget": {"max_usd": args.max_usd, "cache_file": str(cache_path.name)},
+            "status": {
+                "state": "partial" if stopped else "complete",
+                "requested_questions": len(questions),
+                "completed_questions": len(raw),
+                "completed_by_split": split_counts(done),
+                "live_calls": gateway.live_calls,
+                "live_spend_usd": gateway.live_spend,
+                "cost_of_calls_used_usd": used_cost,
+                "total_recorded_in_cache_usd": cache.total_cost(),
+            },
+            "projection": projection_config(estimate),
+        }
+
+        (out_dir / "config.json").write_text(json.dumps(config, indent=2, default=_json_default))
+        write_jsonl(out_dir / "questions.jsonl", [q.to_dict() for q in done])
+        write_jsonl(out_dir / "calls.jsonl", [r.to_log() for r in gateway.records.values()])
+        write_jsonl(out_dir / "per_question.jsonl", per_question_rows(analysis, done))
+        write_csv(out_dir / "summary.csv", summary)
+        write_csv(out_dir / "tau_sweep.csv", [
+            {"cascade": name, "split": analysis.eval_split, "kind": "sweep (not tuned)", **row}
+            for name, rows in sweeps.items() for row in rows
+        ])
+        write_csv(out_dir / "gate_calibration.csv", [
+            {"gate": gate, **row, "brier": data["brier"]}
+            for gate, data in calibration.items() for row in data["reliability"]
+        ])
+        write_csv(out_dir / "gate_risk_coverage.csv", [
+            {"gate": gate, **row}
+            for gate, data in calibration.items() for row in data["risk_coverage"]
+        ])
+        title_prefix = "[DRY RUN, fake responses] " if args.dry_run else ""
+        accuracy_vs_cost(summary, sweeps, out_dir / "accuracy_vs_cost",
+                         f"{title_prefix}Accuracy vs cost ({analysis.eval_split} split)")
+        gate_reliability(calibration, out_dir / "gate_reliability.png",
+                         f"{title_prefix}Gate calibration ({analysis.eval_split} split)")
+        (out_dir / "README.md").write_text(results_readme(run_name, config, summary, calibration))
+
+        print()
+        print(f"{'method':<28}{'n':>4}{'acc':>7}{'USD/q':>10}{'calls/q':>9}{'unparse':>9}")
+        for row in summary:
+            print(f"{row['method']:<28}{row['n']:>4}{row['accuracy']:>7.3f}"
+                  f"{row['mean_usd_per_question']:>10.4f}{row['mean_calls_per_question']:>9.1f}"
+                  f"{row['unparseable']:>9}")
+        print()
+        print("Taus (calibration): " + ", ".join(f"{k}={v:.3f}" for k, v in analysis.taus.items()))
+        print(f"Live spend this run: ${gateway.live_spend:.4f} ({gateway.live_calls} calls)")
+        if stopped:
+            print(f"PARTIAL: {len(raw)} of {len(questions)} questions completed "
+                  f"({split_counts(done)}); outputs cover the completed questions.")
+        if estimate:
+            print(f"Projected cost of the selected {estimate.n_questions}-question run: "
+                  f"${estimate.total_usd:.2f} total, ${estimate.new_usd:.2f} not yet in the cache "
+                  "(details: --estimate-only)")
+        print(f"Outputs: {out_dir}")
+        return 1 if stopped else 0
     finally:
-        if isinstance(transport, HttpTransport):
-            await transport.close()
-    ordered = [q for split in ("calibration", "test") for q in questions if q.split == split]
-    raw = [r for r in results if r is not None]
-    done = [q for q, r in zip(ordered, results) if r is not None]
-    stopped = budget.exhausted and len(raw) < len(questions)
-    if stopped:
-        print(f"Budget guard stopped the run after {len(raw)} of {len(questions)} questions.")
-
-    calibration_done = [q for q in done if q.split == "calibration"]
-    elo_router = None
-    if calibration_done and "elo_router" not in skip:
-        # Replays cached art_r1 tournaments, so it runs even after the budget guard stopped
-        elo_router = await fit_elo_router(runner, calibration_done, models)
-
-    analysis = Analysis(raw, gateway.records, models, elo_router, seed=args.seed, skip=skip)
-    summary = analysis.summary()
-    sweeps = analysis.sweeps()
-    calibration = analysis.gate_calibration()
-    used_cost = sum(analysis.unique_cost(r) for r in raw)
-    try:
-        estimate: Estimate | None = await estimate_from_cache(
-            all_questions, planned, models, cache, args.seed, skip
-        )
-    except ValueError:
-        estimate = None
-
-    versions: dict[str, set[str]] = {}
-    for record in gateway.records.values():
-        versions.setdefault(record.model, set()).add(record.model_version)
-    jev_versions = sorted({
-        v for m, vs in versions.items() if m.startswith("typesafe/") for v in vs
-    })
-    config = {
-        "run_name": run_name,
-        "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "git_commit": git_commit(),
-        "command": " ".join(sys.argv),
-        "dry_run": args.dry_run,
-        "dataset": {
-            "name": pilot_data.DATASET,
-            "revision": pilot_data.REVISION,
-            "subsets_used": list(pilot_data.USED_SUBSETS),
-            "subsets_excluded": pilot_data.EXCLUDED_SUBSETS,
-            "seqqa_subtasks_excluded": list(pilot_data.EXCLUDED_SEQQA_SUBTASKS),
-            "usable_text_only": usable,
-            "sample_size": pilot_data.SAMPLE_SIZE,
-            "split_counts": split_counts(all_questions),
-        },
-        "seed": args.seed,
-        "split": {"calibration": "first 30 sampled", "test": "last 70 sampled"},
-        "selection": {
-            "subsets": args.subsets,
-            "test_per_subset": args.test_per_subset,
-            "skip_methods": sorted(skip),
-            "smoke": args.smoke,
-            "limit": args.limit,
-            "selected_split_counts": split_counts(planned),
-            "run_split_counts": split_counts(questions),
-            "note": "selection keeps the sample's order, indices and splits (no resampling)",
-        },
-        "evaluation_split": analysis.eval_split,
-        "models": [
-            {
-                "id": m.id, "label": m.label, "family": m.family,
-                "prompt_usd_per_mtok": m.prompt_usd_per_mtok,
-                "completion_usd_per_mtok": m.completion_usd_per_mtok,
-                "supports_temperature": m.supports_temperature,
-                "reasoning": m.reasoning,
-                "versions_returned": sorted(versions.get(m.id, set())),
-            }
-            for m in models.models
-        ],
-        "prices_fetched": models.fetched,
-        "roles": models.roles,
-        "temperature": models.temperature,
-        "max_tokens": models.max_tokens,
-        "jev": {
-            "requested_model": models.jev.model,
-            "fallback_model": models.jev.fallback_model,
-            "model_used": jev.model,
-            "versions_returned": jev_versions,
-            "input_usd_per_mtok": models.jev.input_usd_per_mtok,
-        },
-        "taus": analysis.taus,
-        "elo_router": elo_router,
-        "best_single_calibration": analysis.best_single_calibration,
-        "best_single_oracle": analysis.best_single_oracle,
-        "budget": {"max_usd": args.max_usd, "cache_file": str(cache_path.name)},
-        "status": {
-            "state": "partial" if stopped else "complete",
-            "requested_questions": len(questions),
-            "completed_questions": len(raw),
-            "completed_by_split": split_counts(done),
-            "live_calls": gateway.live_calls,
-            "live_spend_usd": gateway.live_spend,
-            "cost_of_calls_used_usd": used_cost,
-            "total_recorded_in_cache_usd": cache.total_cost(),
-        },
-        "projection": projection_config(estimate),
-    }
-
-    (out_dir / "config.json").write_text(json.dumps(config, indent=2, default=_json_default))
-    write_jsonl(out_dir / "questions.jsonl", [q.to_dict() for q in done])
-    write_jsonl(out_dir / "calls.jsonl", [r.to_log() for r in gateway.records.values()])
-    write_jsonl(out_dir / "per_question.jsonl", per_question_rows(analysis, done))
-    write_csv(out_dir / "summary.csv", summary)
-    write_csv(out_dir / "tau_sweep.csv", [
-        {"cascade": name, "split": analysis.eval_split, "kind": "sweep (not tuned)", **row}
-        for name, rows in sweeps.items() for row in rows
-    ])
-    write_csv(out_dir / "gate_calibration.csv", [
-        {"gate": gate, **row, "brier": data["brier"]}
-        for gate, data in calibration.items() for row in data["reliability"]
-    ])
-    write_csv(out_dir / "gate_risk_coverage.csv", [
-        {"gate": gate, **row}
-        for gate, data in calibration.items() for row in data["risk_coverage"]
-    ])
-    title_prefix = "[DRY RUN, fake responses] " if args.dry_run else ""
-    accuracy_vs_cost(summary, sweeps, out_dir / "accuracy_vs_cost",
-                     f"{title_prefix}Accuracy vs cost ({analysis.eval_split} split)")
-    gate_reliability(calibration, out_dir / "gate_reliability.png",
-                     f"{title_prefix}Gate calibration ({analysis.eval_split} split)")
-    (out_dir / "README.md").write_text(results_readme(run_name, config, summary, calibration))
-    cache.close()
-
-    print()
-    print(f"{'method':<28}{'n':>4}{'acc':>7}{'USD/q':>10}{'calls/q':>9}{'unparse':>9}")
-    for row in summary:
-        print(f"{row['method']:<28}{row['n']:>4}{row['accuracy']:>7.3f}"
-              f"{row['mean_usd_per_question']:>10.4f}{row['mean_calls_per_question']:>9.1f}"
-              f"{row['unparseable']:>9}")
-    print()
-    print("Taus (calibration): " + ", ".join(f"{k}={v:.3f}" for k, v in analysis.taus.items()))
-    print(f"Live spend this run: ${gateway.live_spend:.4f} ({gateway.live_calls} calls)")
-    if stopped:
-        print(f"PARTIAL: {len(raw)} of {len(questions)} questions completed "
-              f"({split_counts(done)}); outputs cover the completed questions.")
-    if estimate:
-        print(f"Projected cost of the selected {estimate.n_questions}-question run: "
-              f"${estimate.total_usd:.2f} total, ${estimate.new_usd:.2f} not yet in the cache "
-              "(details: --estimate-only)")
-    print(f"Outputs: {out_dir}")
-    return 1 if stopped else 0
+        # Closed only after every use of the gateway: the ELO router fit replays tournaments
+        # through it, and any call missing from the cache goes to this transport
+        await transport.close()
+        cache.close()
 
 
 def projection_config(estimate: Estimate | None) -> dict[str, Any] | None:
