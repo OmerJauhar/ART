@@ -6,8 +6,8 @@ Projects the cost of a run from calls already in the cache (normally the smoke t
 
 The cache does not store what each call was for, so cached questions are replayed through
 the normal pipeline with a transport that refuses every request. Cache hits come back
-labelled with their stage, nothing is spent, and any refused request marks a question as not
-fully cached. From the cached calls, per stage and model:
+labelled with their stage, nothing is spent, and each refused request is a missing call.
+From the cached calls, per stage and model:
 
     cost per call = multiplier * (completion_tokens * output_price
                                   + (overhead_tokens + question_tokens) * input_price)
@@ -19,13 +19,17 @@ tokens per character for that subset (from its answer calls). The multiplier is 
 over list-price cost for the model, since OpenRouter may route to a provider priced above
 list. The run total counts each distinct call once; per-method figures count each method as
 if it ran alone.
+
+New spend prices only the missing calls. A missing answer also changes every call built on it
+(critiques by and of that model, revisions, fusion, Jev), which the replay cannot see, so those
+planned calls are priced with it. A question with no cached calls is priced whole that way.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
-from collections import Counter
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,9 +37,9 @@ from loguru import logger
 
 from experiments.pilot.analysis import all_methods
 from experiments.pilot.budget import BudgetGuard
-from experiments.pilot.cache import CallCache
+from experiments.pilot.cache import CallCache, request_key
 from experiments.pilot.data import Question
-from experiments.pilot.gateway import QUESTION_ID, ApiError, CallRecord, Gateway
+from experiments.pilot.gateway import QUESTION_ID, STAGE, ApiError, CallRecord, Gateway
 from experiments.pilot.jev import JevClient
 from experiments.pilot.methods import QuestionRunner
 from experiments.pilot.prompts import format_question
@@ -50,16 +54,27 @@ STAGES = ("answer", "critique", "revision", "judge", "fusion", "jev")
 CallId = tuple[str, str, str]
 
 
+# Distinct missing calls of one question: request key -> (kind, model), as in Observation
+Missing = dict[str, tuple[str, str]]
+
+
 class CacheOnlyTransport:
-    """Transport for replays: every request reaching it is a cache miss, refused and counted."""
+    """Transport for replays: every request reaching it is a cache miss, refused and recorded."""
 
     def __init__(self) -> None:
         """Create the transport."""
-        self.misses: Counter[str] = Counter()
+        self.missing: defaultdict[str, Missing] = defaultdict(dict)
 
     async def post(self, url: str, body: dict[str, Any]) -> dict[str, Any]:
-        """Refuse the request."""
-        self.misses[QUESTION_ID.get()] += 1
+        """Record the request as missing and refuse it."""
+        if url.rstrip("/").endswith("/decisions"):
+            types = {q.get("type") for q in (body.get("questions") or {}).values()}
+            kind, model, endpoint = ("jev_pick" if "choice" in types else "jev_gate"), JEV, (
+                "decisions"
+            )
+        else:
+            kind, model, endpoint = STAGE.get(), str(body.get("model", "")), "chat"
+        self.missing[QUESTION_ID.get()][request_key(endpoint, body)] = (kind, model)
         raise ApiError("not_cached", "replays make no API calls")
 
 
@@ -272,6 +287,37 @@ def method_bounds(models: PilotModels) -> dict[str, tuple[set[CallId], ...]]:
     }
 
 
+def answer_dependents(
+    run_calls: set[CallId],
+    models: PilotModels,
+    missing_answers: set[str],
+) -> set[CallId]:
+    """
+    Planned calls that change when these models' answers are missing from the cache.
+
+    A model without an answer is neither critiqued nor critiques (the engine only seats
+    models that answered), and its answer feeds fusion, the Jev picks, every revision and so
+    every round-two critique; the Jev gate reads only the cheap model's answer.
+    """
+    if not missing_answers:
+        return set()
+    cheap = models.roles["cheap"]
+    dependents = set()
+    for call in run_calls:
+        kind, model, detail = call
+        if kind == "answer":
+            hit = model in missing_answers
+        elif kind == "critique":
+            hit = model in missing_answers or detail in missing_answers
+        elif kind == "jev_gate":
+            hit = cheap in missing_answers
+        else:  # revision, critique_r2, fusion, jev_pick
+            hit = True
+        if hit:
+            dependents.add(call)
+    return dependents
+
+
 def call_stage(call: CallId, plan: dict[str, set[CallId]]) -> str:
     """Stage a planned call is reported under; judge-only critiques count as judge."""
     kind = call[0]
@@ -292,6 +338,9 @@ class Estimate:
     total_usd: float
     new_usd: float
     n_questions: int
+    missing_calls: int
+    partial_questions: list[str]
+    partial_whole_usd: float
     cached_questions: list[str]
     cached_billed_usd: float
     cached_estimated_usd: float
@@ -307,6 +356,7 @@ def estimate_cost(
     skip: set[str],
     cached: set[str] | None = None,
     cached_billed_usd: float = 0.0,
+    missing: dict[str, Missing] | None = None,
 ) -> Estimate:
     """
     Project the cost of running the kept methods on the given questions.
@@ -315,9 +365,14 @@ def estimate_cost(
         cost_model: Fitted per-call cost model
         questions: Questions the run will cover
         skip: Methods left out of the run
-        cached: IDs of questions whose calls are all in the cache already (they cost nothing)
+        cached: IDs of questions whose calls are all in the cache already (they cost nothing);
+            any other question is priced whole. Ignored when missing is given.
         cached_billed_usd: What the cached questions' calls actually cost when they were made
+        missing: Each question's missing calls from a replay; a question with none is fully
+            cached, and the others pay only for their missing calls (see the module docstring)
     """
+    if missing is not None:
+        cached = {q.id for q in questions if not missing.get(q.id)}
     cached = cached or set()
     models = cost_model.models
     plan = plan_calls(models, skip)
@@ -325,7 +380,9 @@ def estimate_cost(
     run_calls = set().union(*plan.values()) | {("answer", m, "") for m in models.ids}
     labels = {m.id: m.label for m in models.models}
 
-    total = new = cached_estimated = 0.0
+    total = new = cached_estimated = partial_whole = 0.0
+    missing_calls = 0
+    partial: list[str] = []
     by_stage = {stage: 0.0 for stage in STAGES}
     by_model: dict[str, float] = {}
     per_method = {name: [0.0, 0.0] for name in plan}  # [most expensive, cheapest] case
@@ -335,8 +392,21 @@ def estimate_cost(
         total += question_total
         if question.id in cached:
             cached_estimated += question_total
-        else:
+        elif missing is None:
             new += question_total
+        else:
+            calls = missing[question.id].values()
+            missing_calls += len(calls)
+            partial.append(question.id)
+            partial_whole += question_total
+            lost = {model for kind, model in calls if kind == "answer"}
+            dependents = answer_dependents(run_calls, models, lost)
+            new += sum(costs[c] for c in dependents)
+            for kind, model in calls:
+                # Missing calls other than critiques are covered by the dependents whenever
+                # an answer is missing (the replay built them around the absent answer)
+                if kind == "critique" or (kind != "answer" and not lost):
+                    new += cost_model.call_cost(kind, model, question)
         for call, cost in costs.items():
             by_stage[call_stage(call, plan)] += cost
             name = "jev" if call[1] == JEV else labels[call[1]]
@@ -372,6 +442,9 @@ def estimate_cost(
         total_usd=total,
         new_usd=new,
         n_questions=n,
+        missing_calls=missing_calls,
+        partial_questions=partial,
+        partial_whole_usd=partial_whole,
         cached_questions=sorted(cached & {q.id for q in questions}),
         cached_billed_usd=cached_billed_usd,
         cached_estimated_usd=cached_estimated,
@@ -388,12 +461,12 @@ async def replay(
     cache: CallCache,
     seed: int,
     skip: set[str],
-) -> tuple[dict[str, CallRecord], Counter[str]]:
+) -> tuple[dict[str, CallRecord], defaultdict[str, Missing]]:
     """
     Run questions through the pipeline using only the cache.
 
     Returns:
-        (call records of the cache hits, refused requests per question ID)
+        (call records of the cache hits, distinct missing calls per question ID)
     """
     transport = CacheOnlyTransport()
     gateway = Gateway(transport, cache, BudgetGuard(math.inf), models, concurrency=16)
@@ -405,7 +478,7 @@ async def replay(
         await asyncio.gather(*[runner.run(q) for q in questions])
     finally:
         logger.enable("art_framework")
-    return gateway.records, transport.misses
+    return gateway.records, transport.missing
 
 
 async def estimate_from_cache(
@@ -429,12 +502,13 @@ async def estimate_from_cache(
     """
     records, _ = await replay(sample, models, cache, seed, skip=set())
     cost_model = fit_cost_model(observations(records), {q.id: q for q in sample}, models)
-    selected_records, misses = await replay(selected, models, cache, seed, skip)
-    cached = {q.id for q in selected if misses[q.id] == 0}
+    selected_records, missing = await replay(selected, models, cache, seed, skip)
+    cached = {q.id for q in selected if not missing[q.id]}
     billed = sum(
         r.cost_usd for r in selected_records.values() if r.question_ids & cached
     )
-    return estimate_cost(cost_model, selected, skip, cached, billed)
+    return estimate_cost(cost_model, selected, skip, cached, billed,
+                         missing={q.id: missing[q.id] for q in selected})
 
 
 def format_estimate(estimate: Estimate, max_usd: float, already_recorded: float) -> str:
@@ -484,7 +558,12 @@ def format_estimate(estimate: Estimate, max_usd: float, already_recorded: float)
         f"Already in the cache: {n_cached} of {n} questions (billed "
         f"${estimate.cached_billed_usd:.2f}; this model estimates "
         f"${estimate.cached_estimated_usd:.2f} for them)",
-        f"New spend needed: ${estimate.new_usd:.2f}",
+        f"New spend needed: ${estimate.new_usd:.2f}" + (
+            f" ({estimate.missing_calls} missing calls in {len(estimate.partial_questions)} "
+            f"questions, with the calls built on any missing answer; "
+            f"${estimate.partial_whole_usd:.2f} if those questions were priced whole)"
+            if estimate.partial_questions else ""
+        ),
         f"Budget: the cache already records ${already_recorded:.2f} and --max-usd caps that "
         f"total, so --max-usd {max_usd:.2f} leaves ${max(0.0, max_usd - already_recorded):.2f} "
         f"for new calls.",

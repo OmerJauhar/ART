@@ -6,6 +6,7 @@ All synthetic or fake-provider; no network.
 """
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from experiments.pilot.estimate import (
     CostModel,
     Observation,
     StageFit,
+    answer_dependents,
     estimate_cost,
     estimate_from_cache,
     fit_cost_model,
@@ -288,13 +290,13 @@ class TestEstimate:
         calls_made = transport.calls
         cache = CallCache(tmp_path / "cache.sqlite")
 
-        records, misses = await replay([done, new], models, cache, 0, set())
+        records, missing = await replay([done, new], models, cache, 0, set())
         estimate = await estimate_from_cache([done, new], [done, new], models, cache, 0,
                                              {"art_r2"})
 
         assert transport.calls == calls_made
         assert len(cache) == calls_made
-        assert misses[done.id] == 0 and misses[new.id] > 0
+        assert not missing[done.id] and missing[new.id]
         assert {r.stage for r in records.values()} == {
             "answer", "critique", "revision", "fusion", "jev"
         }
@@ -310,6 +312,92 @@ class TestEstimate:
             sum(r.cost_usd for r in check.records.values())
         )
         assert estimate.cached_billed_usd < sum(r.cost_usd for r in records.values())
+        # A question with nothing cached is priced whole
+        assert estimate.new_usd == pytest.approx(estimate.partial_whole_usd)
+
+
+class TestMissingCalls:
+    """New spend prices only the missing calls, not whole questions."""
+
+    async def cached_question(self, tmp_path: Path) -> tuple[Question, Any, CallCache]:
+        """
+        Two questions run in full through the fake provider; the first, its gateway (call
+        records of the first question only) and the cache. The second keeps every stage
+        fitted when calls of the first are deleted.
+        """
+        models = load_models()
+        question, other = make_question(0), make_question(1)
+        for q in (other, question):
+            gateway = make_gateway(tmp_path, FakeTransport([question, other], models),
+                                   models=models)
+            await QuestionRunner(gateway, models, JevClient(gateway, models.jev.model),
+                                 seed=0, skip={"art_r2"}).run(q)
+        self.sample = [question, other]
+        return question, gateway, CallCache(tmp_path / "cache.sqlite")
+
+    @staticmethod
+    def drop(cache: CallCache, key: str) -> None:
+        """Delete one call from a test cache file."""
+        with sqlite3.connect(cache.path) as conn:
+            conn.execute("DELETE FROM calls WHERE key = ?", (key,))
+
+    async def estimate(self, question: Question, cache: CallCache) -> Any:
+        """The estimate for a skip-art_r2 run of this one question."""
+        return await estimate_from_cache(self.sample, [question], load_models(), cache, 0,
+                                         {"art_r2"})
+
+    @pytest.mark.asyncio
+    async def test_fully_cached(self, tmp_path: Path) -> None:
+        """Test that a fully cached question needs no new spend."""
+        question, _, cache = await self.cached_question(tmp_path)
+
+        estimate = await self.estimate(question, cache)
+
+        assert estimate.new_usd == 0.0
+        assert estimate.missing_calls == 0
+        assert estimate.cached_questions == [question.id]
+
+    @pytest.mark.asyncio
+    async def test_one_missing_critique(self, tmp_path: Path) -> None:
+        """Test that one missing critique costs one critique, not the whole question."""
+        question, gateway, cache = await self.cached_question(tmp_path)
+        models = load_models()
+        critic = next(m for m in models.ids if m != models.roles["judge"])
+        record = next(r for r in gateway.records.values()
+                      if r.stage == "critique" and r.model == critic)
+        self.drop(cache, record.key)
+
+        estimate = await self.estimate(question, cache)
+
+        assert estimate.missing_calls == 1
+        assert estimate.partial_questions == [question.id]
+        assert estimate.new_usd == pytest.approx(
+            estimate.cost_model.call_cost("critique", critic, question)
+        )
+        assert estimate.new_usd < estimate.partial_whole_usd / 10
+
+    @pytest.mark.asyncio
+    async def test_missing_answer_prices_its_dependents(self, tmp_path: Path) -> None:
+        """Test that a missing answer also prices the calls built on it."""
+        question, gateway, cache = await self.cached_question(tmp_path)
+        models = load_models()
+        lost = next(m for m in models.ids if m not in models.roles.values())
+        record = next(r for r in gateway.records.values()
+                      if r.stage == "answer" and r.model == lost)
+        self.drop(cache, record.key)
+
+        estimate = await self.estimate(question, cache)
+
+        run_calls = set().union(*plan_calls(models, {"art_r2"}).values())
+        dependents = answer_dependents(run_calls, models, {lost})
+        # Its answer, the 3 critiques of it (the judge's is one of them), its 3 critiques,
+        # fusion and both Jev picks; never the other answers or the critiques among them
+        assert len(dependents) == 10
+        assert ("answer", lost, "") in dependents
+        assert not any(c[0] == "answer" and c[1] != lost for c in dependents)
+        expected = sum(estimate.cost_model.call_cost(c[0], c[1], question) for c in dependents)
+        assert estimate.new_usd == pytest.approx(expected)
+        assert 0 < estimate.new_usd < estimate.partial_whole_usd
 
 
 class TestGateway402:
