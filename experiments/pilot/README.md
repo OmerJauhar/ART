@@ -143,8 +143,8 @@ All on the same questions, all reusing cached calls.
 
 Cascade thresholds maximize cascade accuracy on the calibration split, ties going to higher
 coverage. The test result is reported at that tau. A tau sweep from 0 to 1 on the test split is
-saved separately (`tau_sweep.csv`, and lines on the accuracy-vs-cost plot) and is labelled as a
-sweep, not a tuned result.
+saved separately (`tau_sweep.csv`; the accuracy-vs-cost plot does not draw it) and is labelled
+as a sweep, not a tuned result.
 
 The ART methods use the real framework: `PilotAgent` subclasses `LLMAgent` and overrides only
 `_call_llm` to send requests through the cache and budget guard; ART's prompts, critique parsing
@@ -270,7 +270,7 @@ basis.
 | `summary.csv` | per method: accuracy with bootstrap 95% CI, USD/question, calls/question, tokens, latency, unparseable and refused counts, coverage |
 | `tau_sweep.csv` | both cascades' accuracy, cost and coverage for tau 0..1 on the test split |
 | `gate_calibration.csv`, `gate_risk_coverage.csv`, `gate_reliability.png` | reliability deciles, Brier score and risk-coverage for both gates |
-| `accuracy_vs_cost.png` / `.svg` | accuracy (with CI) vs mean USD/question on a log axis, plus the cascade sweeps |
+| `accuracy_vs_cost.png` / `.svg` | accuracy (with CI) vs mean USD/question on a log axis, with the best accuracy reached at each cost |
 | `README.md`, `run.log` | short results summary with total spend, provider refusals and dropped critiques; full log |
 
 ## Publishing (`published/<run_name>/`, tracked)
