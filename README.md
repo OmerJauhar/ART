@@ -254,7 +254,7 @@ flowchart TD
 Paper: [arXiv:2512.00617](https://arxiv.org/abs/2512.00617)
 
 The paper's experiments used simulated (mock) agents with fixed quality parameters, not real
-language models. A rerun on real models is in progress.
+language models. The real-model rerun is in the pilot section below.
 
 ## 🔁 Changes since the paper (v1.0-paper)
 
