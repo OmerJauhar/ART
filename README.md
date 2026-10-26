@@ -1,7 +1,7 @@
 # ART: Adaptive Response Tuning
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB)](https://python.org/)
-[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE)
 [![arXiv](https://img.shields.io/badge/arXiv-2512.00617-b31b1b)](https://arxiv.org/abs/2512.00617)
 
 ART is a multi-agent framework for improving language-model answers through peer review.
@@ -196,4 +196,4 @@ If you use ART, please cite the paper: [arXiv:2512.00617](https://arxiv.org/abs/
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE).
